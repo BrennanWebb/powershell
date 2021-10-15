@@ -1,0 +1,1 @@
+Ping.exe -t google.com | ForEach-Object {"{0} - {1}" -f (Get-Date),$_} | Tee-Object C:\Temp\ping.log -Append
