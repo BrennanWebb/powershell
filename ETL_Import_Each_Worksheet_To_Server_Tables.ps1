@@ -2,7 +2,7 @@
 <#Overview:
 The following code will take in the path of an excel workbook and loop through each worksheet.
 Each worksheet will be written to table under the designated server.database.schema.worksheet name.
-The -force tag will overwrite any existing tables.
+The -force tag creates missing SQL Server objects.
 The $drop variable will drop the table before load.
 Powershell 5.0, 7.1.4, 7.2.5 tested.
 Required Modules: Install-Module -Name ImportExcel, SqlServer;
