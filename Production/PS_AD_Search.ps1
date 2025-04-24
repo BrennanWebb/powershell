@@ -267,7 +267,7 @@ if ($UserName) {
 
 # Interactive main loop for user choice
 while ($true) {
-    Write-ArtsyHeader -title "Welcome     " -foregroundcolor Green
+    Write-ArtsyHeader -title "Welcome   " -foregroundcolor Green
     Write-Host "Choose Search Type" -ForegroundColor Cyan
     Write-Host "[1] User Search"
     Write-Host "[2] Group Search"
