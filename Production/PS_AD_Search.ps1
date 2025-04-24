@@ -14,6 +14,10 @@ $domains = @("SQSENIOR", "SQIS-CORP")
 function UserSearch {
     # Prompt user for username
     $userName = Read-Host "Enter the username to search (e.g. jdoe)"
+    if ([string]::IsNullOrWhiteSpace($userName)) {
+        Write-Host "Username is required. Restarting..." -ForegroundColor Red
+        continue
+    }
 
     # Initialize list for all group memberships
     $allGroups = @()
@@ -63,13 +67,17 @@ function UserSearch {
     # Export to Excel
     $sheetName = "$userName-Groups" -replace '[\/]','-'
     $allGroups |
-        Select-Object Name, SamAccountName, GroupScope, Domain, DistinguishedName, MemberCount |
+        Select-Object Name, SamAccountName, GroupScope, Domain, MemberCount, DistinguishedName |
         Export-Excel -AutoSize -Show -WorksheetName $sheetName
 }
 
 function GroupSearch {
     # Prompt user for group name
     $groupName = Read-Host "Enter the AD group name to search"
+    if ([string]::IsNullOrWhiteSpace($groupName)) {
+        Write-Host "Username is required. Restarting..." -ForegroundColor Red
+        continue
+    }
 
     # If groupName includes a domain prefix, prioritize that domain
     if ($groupName -match '^(?<domain>[^\\/]+)[\\/](?<name>.+)$') {
