@@ -11,11 +11,22 @@ if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
 # Define domain array
 $domains = @("SQSENIOR", "SQIS-CORP")
 
+function Write-ArtsyHeader {
+    param ([string]$title 
+          ,[string]$ForegroundColor = "Cyan"
+    )
+    Write-Host "===========================================" -ForegroundColor $ForegroundColor
+    Write-Host "===       AD Search: $title       ===" -ForegroundColor $ForegroundColor
+    Write-Host "===========================================" -ForegroundColor $ForegroundColor
+}
+
 function UserSearch {
+    Write-ArtsyHeader -title "User Search" -ForegroundColor Cyan
+
     # Prompt user for username
     $userName = Read-Host "Enter the username to search (e.g. jdoe)"
     if ([string]::IsNullOrWhiteSpace($userName)) {
-        Write-Host "Username is required. Restarting..." -ForegroundColor Red
+        Write-Host "Username is required." -ForegroundColor Red
         continue
     }
 
@@ -26,7 +37,9 @@ function UserSearch {
         Write-Host "Searching in domain: $domain" -ForegroundColor Cyan
         try {
             $user = Get-ADUser -Identity $userName -Server $domain -Properties MemberOf
+            Write-Host "User '$userName' found in domain '$domain'." -ForegroundColor Green
             if ($user) {
+                Write-Host "Searching in '$domain' for memberships." -ForegroundColor Cyan
                 $groups = $user.MemberOf | ForEach-Object {
                     try {
                         $group = Get-ADGroup -Identity $_ -Server $domain -Properties Members
@@ -65,6 +78,7 @@ function UserSearch {
     }
 
     # Export to Excel
+    Write-Host "Exporting Results." -ForegroundColor Cyan
     $sheetName = "$userName-Groups" -replace '[\/]','-'
     $allGroups |
         Select-Object Name, SamAccountName, GroupScope, Domain, MemberCount, DistinguishedName |
@@ -72,10 +86,13 @@ function UserSearch {
 }
 
 function GroupSearch {
+
+    Write-ArtsyHeader -title "Group Search" -foregroundcolor cyan
+    
     # Prompt user for group name
     $groupName = Read-Host "Enter the AD group name to search"
     if ([string]::IsNullOrWhiteSpace($groupName)) {
-        Write-Host "Username is required. Restarting..." -ForegroundColor Red
+        Write-Host "Group name is required." -ForegroundColor Red
         continue
     }
 
@@ -173,8 +190,9 @@ function GroupSearch {
 
     Write-Progress -Activity "Complete" -Completed
 
+    # Export to Excel
+    Write-Host "Exporting Results." -ForegroundColor Cyan
     $sheetName = "$resolvedDomain-$groupName" -replace '[\\/]','-'
-
     $results |
         Select-Object Name, SamAccountName, ObjectClass, Domain |
         Export-Excel -AutoSize -Show -WorksheetName $sheetName
@@ -182,6 +200,7 @@ function GroupSearch {
 
 # Main prompt loop
 while ($true) {
+    Write-ArtsyHeader -title "Welcome   " -foregroundcolor Green
     Write-Host "Choose Search Type" -ForegroundColor Cyan
     Write-Host "[1] User Search"
     Write-Host "[2] Group Search"
