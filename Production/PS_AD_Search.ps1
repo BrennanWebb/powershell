@@ -1,5 +1,4 @@
 # PS_AD_Search - Combined AD User and Group Search Tool
-# Version: 1.0.6
 # Description: Interactive script to search Active Directory for user group memberships or group members across multiple domains. Supports CLI parameters and help display.
 
 # Define command-line parameters
@@ -9,14 +8,22 @@ param (
     [string]$GroupName
 )
 
+# Ensure ImportExcel module is installed
+if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
+    Write-Host "Installing ImportExcel module..." -ForegroundColor Cyan
+    Install-Module -Name ImportExcel -Force -Scope CurrentUser
+}
+
 # Global variable to track auto-export preference
 $global:AutoExport = $true
 
 # Display help content if -Help is passed
-if ($showHelp) {
+if ($showHelp) {helper}
+
+function Helper {
     Write-Host @"
 PS_AD_Search - Combined AD User and Group Search Tool
-Version: 1.0.6
+Version: 1.0.7
 
 USAGE:
     powershell.exe -File .\PS_AD_Search.ps1
@@ -38,11 +45,7 @@ REQUIREMENTS:
     exit
 }
 
-# Ensure ImportExcel module is installed
-if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
-    Write-Host "Installing ImportExcel module..." -ForegroundColor Cyan
-    Install-Module -Name ImportExcel -Force -Scope CurrentUser
-}
+
 
 # Define the domains to search in
 $domains = @("SQSENIOR", "SQIS-CORP")
@@ -265,10 +268,12 @@ while ($true) {
     Write-Host "Choose Search Type" -ForegroundColor Cyan
     Write-Host "[1] User Search"
     Write-Host "[2] Group Search"
-    $choice = Read-Host "Enter choice (1 or 2)"
+    Write-Host "[0] Help"
+    $choice = Read-Host "Enter choice (1 or 2) or 0 for help"
     switch ($choice) {
         '1' { UserSearch }
         '2' { GroupSearch }
+        '0' { Helper }
         default { Write-Host "Invalid choice. Please enter 1 or 2." -ForegroundColor Red; continue }
     }
     $again = Read-Host "Would you like to run another search? (Y to continue, Enter to exit)"
