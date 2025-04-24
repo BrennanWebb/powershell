@@ -42,10 +42,8 @@ REQUIREMENTS:
     - Appropriate permissions for AD access across domains
 
 "@ -ForegroundColor Cyan
-    exit
+    Return
 }
-
-
 
 # Define the domains to search in
 $domains = @("SQSENIOR", "SQIS-CORP")
