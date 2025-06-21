@@ -42,10 +42,12 @@
 .NOTES
     Designer: Brennan Webb
     Script Engine: Gemini
-    Version: 1.9-preview
+    Version: 2.0
     Created: 2025-06-21
     Modified: 2025-06-21
     Change Log:
+    - v2.0: Updated output directory to be segmented by model name.
+    - v2.0: Promoted to major version after preview cycle.
     - v1.9-preview: Updated AI prompt to explicitly forbid Markdown within recommendation comments.
     - v1.8-preview: Implemented a one-time, persistent model selection configuration.
     - v1.8-preview: Updated reset logic to include clearing the selected model.
@@ -833,7 +835,7 @@ You should consider the following categories of recommendations. For any given T
     * **Create New Index:** If no existing index is a suitable candidate for alteration, recommend a new, covering index. Provide the complete `CREATE INDEX` DDL.
 
 Comment Formatting:
-Every analysis comment block you add MUST use the following structure. The block starts with a general "Optimus Analysis" header. Inside, each distinct recommendation is numbered and contains the three required sections. This allows for multiple, independent suggestions for the same statement. Important: All text inside the comment block must be plain text. Do not use any Markdown formatting.
+Every analysis comment block you add MUST use the following structure. The block starts with a general "Optimus Analysis" header. Inside, each distinct recommendation is numbered and contains the three required sections. This allows for multiple, independent suggestions for the same statement. Important: All text inside the comment block must be plain text. Do not use any Markdown formatting like **bolding** or `backticks`.
 
 /*
 --- Optimus Analysis ---
@@ -955,7 +957,7 @@ Timestamp: $(Get-Date)
 # --- Main Application Logic ---
 function Start-Optimus {
     # Define the current version of the script in one place.
-    $script:CurrentVersion = "1.9-preview"
+    $script:CurrentVersion = "2.0"
 
     if ($DebugMode) { Write-Log -Message "Starting Optimus v$($script:CurrentVersion) in Debug Mode." -Level 'DEBUG'}
 
@@ -1024,9 +1026,17 @@ function Start-Optimus {
             }
         }
 
-        # Create the single parent batch folder
+        # Create the model-specific and batch parent folders
+        $sanitizedModelName = $script:ChosenModel -replace '[.-]', '_'
+        $modelSpecificPath = Join-Path -Path $script:OptimusConfig.AnalysisBaseDir -ChildPath $sanitizedModelName
+
+        # Ensure the model-specific parent directory exists
+        if (-not (Test-Path -Path $modelSpecificPath)) {
+            New-Item -Path $modelSpecificPath -ItemType Directory -Force | Out-Null
+        }
+
         $batchTimestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-        $batchFolderPath = Join-Path -Path $script:OptimusConfig.AnalysisBaseDir -ChildPath $batchTimestamp
+        $batchFolderPath = Join-Path -Path $modelSpecificPath -ChildPath $batchTimestamp
         New-Item -Path $batchFolderPath -ItemType Directory -Force | Out-Null
         Write-Log -Message "`nCreated batch analysis folder: $batchFolderPath" -Level 'SUCCESS'
 
