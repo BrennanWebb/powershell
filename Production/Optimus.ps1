@@ -42,10 +42,11 @@
 .NOTES
     Designer: Brennan Webb
     Script Engine: Gemini
-    Version: 1.8-preview
+    Version: 1.9-preview
     Created: 2025-06-21
     Modified: 2025-06-21
     Change Log:
+    - v1.9-preview: Updated AI prompt to explicitly forbid Markdown within recommendation comments.
     - v1.8-preview: Implemented a one-time, persistent model selection configuration.
     - v1.8-preview: Updated reset logic to include clearing the selected model.
     - v1.7-preview: Corrected and hardened the AI prompt to ensure the full original script is always returned.
@@ -832,7 +833,7 @@ You should consider the following categories of recommendations. For any given T
     * **Create New Index:** If no existing index is a suitable candidate for alteration, recommend a new, covering index. Provide the complete `CREATE INDEX` DDL.
 
 Comment Formatting:
-Every analysis comment block you add MUST use the following structure. The block starts with a general "Optimus Analysis" header. Inside, each distinct recommendation is numbered and contains the three required sections. This allows for multiple, independent suggestions for the same statement.
+Every analysis comment block you add MUST use the following structure. The block starts with a general "Optimus Analysis" header. Inside, each distinct recommendation is numbered and contains the three required sections. This allows for multiple, independent suggestions for the same statement. Important: All text inside the comment block must be plain text. Do not use any Markdown formatting.
 
 /*
 --- Optimus Analysis ---
@@ -954,7 +955,7 @@ Timestamp: $(Get-Date)
 # --- Main Application Logic ---
 function Start-Optimus {
     # Define the current version of the script in one place.
-    $script:CurrentVersion = "1.8-preview"
+    $script:CurrentVersion = "1.9-preview"
 
     if ($DebugMode) { Write-Log -Message "Starting Optimus v$($script:CurrentVersion) in Debug Mode." -Level 'DEBUG'}
 
@@ -1103,7 +1104,7 @@ function Start-Optimus {
                 try { $consolidatedSchema | Set-Content -Path $schemaPath -Encoding UTF8; Write-Log -Message "Consolidated schema saved." -Level 'DEBUG' } catch { Write-Log -Message "Could not save consolidated schema file." -Level 'WARN' }
 
                 # 4. Make single "Omnibus" call to AI
-                $finalScript = Invoke-GeminiAnalysis -ApiKey $script:GeminiApiKey -FullSqlText $sqlQueryText -ConsolidatedSchema $consolidatedSchema -MasterPlanXml $masterPlanXml -SqlServerVersion $sqlVersion -ModelName $script:ChosenModel
+                $finalScript = Invoke-GeminiAnalysis -ModelName $script:ChosenModel -ApiKey $script:GeminiApiKey -FullSqlText $sqlQueryText -ConsolidatedSchema $consolidatedSchema -MasterPlanXml $masterPlanXml -SqlServerVersion $sqlVersion
                 
                 # 5. Process and save the final result
                 if ($finalScript) {
