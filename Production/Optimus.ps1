@@ -42,10 +42,11 @@
 .NOTES
     Designer: Brennan Webb
     Script Engine: Gemini
-    Version: 1.2-preview
+    Version: 1.3-preview
     Created: 2025-06-21
     Modified: 2025-06-21
     Change Log:
+    - v1.3-preview: Added an option to Reset-OptimusConfiguration to remove only analysis reports.
     - v1.2-preview: Renamed function to use an approved PowerShell verb (Invoke-OptimusVersionCheck).
     - v1.1-preview: Added an automatic version check at startup.
     - v1.0-preview: Initial preview release. Re-versioned from legacy builds.
@@ -131,7 +132,8 @@ function Reset-OptimusConfiguration {
 
     Write-Log -Message "`n--- Optimus Configuration Reset ---" -Level 'WARN'
     Write-Log -Message "[1] Reset Configuration Only (deletes API key and server list)" -Level 'PROMPT'
-    Write-Log -Message "[2] Full Reset (deletes configuration AND all past analysis reports)" -Level 'PROMPT'
+    Write-Log -Message "[2] Remove all Analysis Reports" -Level 'PROMPT'
+    Write-Log -Message "[3] Full Reset (deletes configuration AND all past analysis reports)" -Level 'PROMPT'
     Write-Log -Message "[Q] Quit / Cancel" -Level 'PROMPT'
 
     Write-Log -Message "Enter your choice: " -Level 'PROMPT' -NoNewLine
@@ -164,6 +166,29 @@ function Reset-OptimusConfiguration {
             }
         }
         '2' {
+            Write-Log -Message "Are you sure you want to delete ALL past analysis reports? This action cannot be undone. (Y/N): " -Level 'PROMPT' -NoNewLine
+            $confirm = Read-Host
+            Write-Host ""
+            Write-Log -Message "User Input: $confirm" -Level 'DEBUG'
+            if ($confirm -match '^[Yy]$') {
+                try {
+                    $analysisDir = Join-Path -Path $configDir -ChildPath "Analyses"
+                    if (Test-Path $analysisDir) {
+                        Remove-Item -Path $analysisDir -Recurse -Force
+                        Write-Log -Message "All analysis reports have been deleted." -Level 'SUCCESS'
+                    } else {
+                        Write-Log -Message "Analysis reports directory not found. Nothing to delete." -Level 'INFO'
+                    }
+                    return $true
+                } catch {
+                    Write-Log -Message "Failed to remove the analysis reports directory: $($_.Exception.Message)" -Level 'ERROR'
+                    return $false
+                }
+            } else {
+                return $false
+            }
+        }
+        '3' {
             Write-Log -Message "WARNING: This will delete ALL configuration AND all saved analysis reports. This action cannot be undone. Are you absolutely sure? (Y/N): " -Level 'PROMPT' -NoNewLine
             $confirm = Read-Host
             Write-Host ""
@@ -880,7 +905,7 @@ Timestamp: $(Get-Date)
 # --- Main Application Logic ---
 function Start-Optimus {
     # Define the current version of the script in one place.
-    $script:CurrentVersion = "1.2-preview"
+    $script:CurrentVersion = "1.3-preview"
 
     if ($DebugMode) { Write-Log -Message "Starting Optimus v$($script:CurrentVersion) in Debug Mode." -Level 'DEBUG'}
 
