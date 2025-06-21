@@ -40,17 +40,13 @@
     Runs a batch analysis on all .sql files located directly within the C:\My TSQL Projects\Batch1 folder.
 
 .NOTES
-    Author: Gemini
-    Version: 13.0
-    Created: 2025-06-17
+    Designer: Brennan Webb
+    Script Engine: Gemini
+    Version: 1.0-preview
+    Created: 2025-06-21
     Modified: 2025-06-21
     Change Log:
-    - v13.0: Reworked the AI prompt to support multiple, well-formatted recommendations per T-SQL statement.
-    - v12.2: Removed indentation from success messages for better UI alignment.
-    - v12.1: Indented console prompts for better readability.
-    - v12.0: Added -FolderPath parameter to enable batch analysis of all .sql files in a directory (non-recursive). Implemented parameter sets.
-    - v11.2: Minor text change for a log message.
-    - v11.1: Corrected Write-Log function to ensure all message levels are always written to the log file.
+    - v1.0-preview: Initial preview release. Re-versioned from legacy builds.
     Powershell Version: 5.1+
 #>
 [CmdletBinding(DefaultParameterSetName = 'Interactive')]
@@ -424,7 +420,7 @@ function Select-SqlServer {
 function Show-FilePicker {
     Write-Log -Message "Entering Function: Show-FilePicker" -Level 'DEBUG'
     
-    $initialDir = [System.Environment]::GetFolderPath('MyDocuments')
+    $initialDir = [System.Environment]::getFolderPath('MyDocuments')
     $lastPathFile = $script:OptimusConfig.LastPathFile
     
     if (Test-Path -Path $lastPathFile) {
@@ -842,7 +838,7 @@ Timestamp: $(Get-Date)
 
 # --- Main Application Logic ---
 function Start-Optimus {
-    if ($DebugMode) { Write-Log -Message "Starting Optimus v13.0 in Debug Mode." -Level 'DEBUG'}
+    if ($DebugMode) { Write-Log -Message "Starting Optimus v1.0-preview in Debug Mode." -Level 'DEBUG'}
 
     # Group prerequisite checks
     $checksPassed = {
@@ -869,7 +865,7 @@ function Start-Optimus {
 
     if (-not $checksPassed) { return }
 
-    Write-Log -Message "`n--- Welcome to Optimus v13.0 ---" -Level 'SUCCESS'
+    Write-Log -Message "`n--- Welcome to Optimus v1.0-preview ---" -Level 'SUCCESS'
     if (-not $DebugMode) { Write-Log -Message "All prerequisite checks passed." -Level 'SUCCESS' }
     
     do { # Outer loop to allow running multiple batches
@@ -919,7 +915,7 @@ function Start-Optimus {
 
                 # Set up the log file path for this specific analysis
                 $script:LogFilePath = Join-Path -Path $script:AnalysisPath -ChildPath "ExecutionLog.txt"
-                "# Optimus v13.0 Execution Log | File: $fileNameOnly | Started: $(Get-Date)" | Out-File -FilePath $script:LogFilePath -Encoding utf8
+                "# Optimus v1.0-preview Execution Log | File: $fileNameOnly | Started: $(Get-Date)" | Out-File -FilePath $script:LogFilePath -Encoding utf8
                 
                 Write-Log -Message "Created analysis directory: '$($script:AnalysisPath)'" -Level 'INFO'
                 $sqlVersion = Get-SqlServerVersion -ServerInstance $selectedServer
@@ -974,7 +970,7 @@ function Start-Optimus {
                 try { $consolidatedSchema | Set-Content -Path $schemaPath -Encoding UTF8; Write-Log -Message "Consolidated schema saved." -Level 'DEBUG' } catch { Write-Log -Message "Could not save consolidated schema file." -Level 'WARN' }
 
                 # 4. Make single "Omnibus" call to AI
-                $finalScript = Invoke-GeminiAnalysis -ApiKey $script:GeminiApiKey -FullSqlText $sqlQueryText -ConsolidatedSchema $consolidatedSchema -MasterPlanXml $masterPlanXml -SqlServerVersion $sqlVersion
+                $finalScript = Invoke-GeminiAnalysis -ApiKey $script:GeminiApiKey -FullSqlText $sqlQueryText -ConsolidatedSchema $consolidatedschema -MasterPlanXml $masterPlanXml -SqlServerVersion $sqlVersion
                 
                 # 5. Process and save the final result
                 if ($finalScript) {
