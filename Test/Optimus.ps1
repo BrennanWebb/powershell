@@ -41,11 +41,10 @@
 
 .NOTES
     Author: Gemini
-    Version: 13.1
+    Version: 13.0
     Created: 2025-06-17
     Modified: 2025-06-21
     Change Log:
-    - v13.1: Added explicit instruction to the AI prompt to not use markdown formatting in its response.
     - v13.0: Reworked the AI prompt to support multiple, well-formatted recommendations per T-SQL statement.
     - v12.2: Removed indentation from success messages for better UI alignment.
     - v12.1: Indented console prompts for better readability.
@@ -425,7 +424,7 @@ function Select-SqlServer {
 function Show-FilePicker {
     Write-Log -Message "Entering Function: Show-FilePicker" -Level 'DEBUG'
     
-    $initialDir = [System.Environment]::getFolderPath('MyDocuments')
+    $initialDir = [System.Environment]::GetFolderPath('MyDocuments')
     $lastPathFile = $script:OptimusConfig.LastPathFile
     
     if (Test-Path -Path $lastPathFile) {
@@ -743,7 +742,6 @@ Every analysis comment block you add MUST use the following structure. The block
 Final Output Rules:
 - Your entire response must be ONLY the T-SQL script text.
 - If you add comments, they must be placed directly above the relevant statement in the original script using the format specified above.
-- Do not use any markdown formatting (e.g., ```sql). All T-SQL code in the 'Recommended Code' section must be plain text.
 - If the entire script is already optimal and you have no comments to add, return only the original, unmodified T-SQL script text.
 - Do not include any conversational text, greetings, or explanations outside of the T-SQL comments.
 
@@ -844,7 +842,7 @@ Timestamp: $(Get-Date)
 
 # --- Main Application Logic ---
 function Start-Optimus {
-    if ($DebugMode) { Write-Log -Message "Starting Optimus v13.1 in Debug Mode." -Level 'DEBUG'}
+    if ($DebugMode) { Write-Log -Message "Starting Optimus v13.0 in Debug Mode." -Level 'DEBUG'}
 
     # Group prerequisite checks
     $checksPassed = {
@@ -871,7 +869,7 @@ function Start-Optimus {
 
     if (-not $checksPassed) { return }
 
-    Write-Log -Message "`n--- Welcome to Optimus v13.1 ---" -Level 'SUCCESS'
+    Write-Log -Message "`n--- Welcome to Optimus v13.0 ---" -Level 'SUCCESS'
     if (-not $DebugMode) { Write-Log -Message "All prerequisite checks passed." -Level 'SUCCESS' }
     
     do { # Outer loop to allow running multiple batches
@@ -917,11 +915,11 @@ function Start-Optimus {
                 # Create a sub-folder for this specific file's analysis
                 $baseName = [System.IO.Path]::GetFileNameWithoutExtension($sqlFilePath)
                 $script:AnalysisPath = Join-Path -Path $batchFolderPath -ChildPath $baseName
-                New-item -Path $script:AnalysisPath -ItemType Directory -Force | Out-Null
+                New-Item -Path $script:AnalysisPath -ItemType Directory -Force | Out-Null
 
                 # Set up the log file path for this specific analysis
                 $script:LogFilePath = Join-Path -Path $script:AnalysisPath -ChildPath "ExecutionLog.txt"
-                "# Optimus v13.1 Execution Log | File: $fileNameOnly | Started: $(Get-Date)" | Out-File -FilePath $script:LogFilePath -Encoding utf8
+                "# Optimus v13.0 Execution Log | File: $fileNameOnly | Started: $(Get-Date)" | Out-File -FilePath $script:LogFilePath -Encoding utf8
                 
                 Write-Log -Message "Created analysis directory: '$($script:AnalysisPath)'" -Level 'INFO'
                 $sqlVersion = Get-SqlServerVersion -ServerInstance $selectedServer
@@ -944,7 +942,7 @@ function Start-Optimus {
                 # 2. Parse unique object names from the plan
                 [xml]$masterPlan = $masterPlanXml
                 $ns = New-Object System.Xml.XmlNamespaceManager($masterPlan.NameTable)
-                $ns.AddNamespace("sql", "[http://schemas.microsoft.com/sqlserver/2004/07/showplan](http://schemas.microsoft.com/sqlserver/2004/07/showplan)")
+                $ns.AddNamespace("sql", "http://schemas.microsoft.com/sqlserver/2004/07/showplan")
                 [string[]]$uniqueObjectNames = @(Get-ObjectsFromPlan -MasterPlan $masterPlan -NamespaceManager $ns)
                 $statementNodes = $masterPlan.SelectNodes("//sql:StmtSimple", $ns)
                 
