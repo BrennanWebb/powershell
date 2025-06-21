@@ -42,10 +42,12 @@
 .NOTES
     Designer: Brennan Webb
     Script Engine: Gemini
-    Version: 1.4-preview
+    Version: 1.5-preview
     Created: 2025-06-21
     Modified: 2025-06-21
     Change Log:
+    - v1.5-preview: Modified plan collection to capture all statements in a script.
+    - v1.5-preview: Hardened schema collection to support system tables.
     - v1.4-preview: Removed the logic that excludes 'sys' schema objects from analysis.
     - v1.3-preview: Added an option to Reset-OptimusConfiguration to remove only analysis reports.
     - v1.2-preview: Renamed function to use an approved PowerShell verb (Invoke-OptimusVersionCheck).
@@ -594,7 +596,6 @@ function Get-MasterExecutionPlan {
     $dbContextForCheck = if ([string]::IsNullOrWhiteSpace($DatabaseContext)) { 'master' } else { $DatabaseContext }
     Write-Log -Message "Using database context '$dbContextForCheck' to generate plan." -Level 'DEBUG'
 
-    # Clean the input query to prevent issues with trailing GOs
     $cleanQueryText = $FullQueryText.Trim()
     if ($cleanQueryText.ToUpper().EndsWith('GO')) {
         $cleanQueryText = $cleanQueryText.Substring(0, $cleanQueryText.Length - 2).Trim()
@@ -604,35 +605,30 @@ function Get-MasterExecutionPlan {
     try {
         $planResult = Invoke-Sqlcmd -ServerInstance $ServerInstance -Database $dbContextForCheck -TrustServerCertificate -Query $planQuery -MaxCharLength ([int]::MaxValue) -ErrorAction Stop
         
-        $xmlPlanString = $null
-        $resultSets = @($planResult)
-        
-        # In a multi-batch script, we iterate backwards and take the FIRST valid plan we find,
-        # which corresponds to the LAST actual query batch in the script.
-        for ($i = $resultSets.Count - 1; $i -ge 0; $i--) {
-            $resultSet = $resultSets[$i]
+        $planFragments = @()
+        foreach ($resultSet in $planResult) {
             if ($resultSet) {
                 $potentialPlan = $resultSet.Item(0)
-                # Check for a non-trivial plan to avoid empty plans from USE statements
-                if ($potentialPlan -is [string] -and $potentialPlan -like '<*showplan*>' -and $potentialPlan.Length -gt 500) { 
-                    $xmlPlanString = $potentialPlan
-                    break
+                if ($potentialPlan -is [string] -and $potentialPlan -like '<*showplan*>') {
+                    $planFragments += $potentialPlan
                 }
             }
         }
         
-        if (-not $xmlPlanString) {
+        if ($planFragments.Count -eq 0) {
             Write-Log -Message "Could not find a valid execution plan string in the results from SQL Server." -Level 'ERROR'
-            Write-Log -Message "The SQL script might be producing result sets that are interfering with plan capture." -Level 'DEBUG'
             return $null
         }
 
+        # Combine all found plan fragments into a single master XML document
+        $masterPlanXml = "<MasterShowPlan>" + ($planFragments -join '') + "</MasterShowPlan>"
+        
         try {
-            [xml]$xmlPlanString | Out-Null
-            Write-Log -Message "Successfully generated and validated master execution plan." -Level 'SUCCESS'
-            return $xmlPlanString
+            [xml]$masterPlanXml | Out-Null
+            Write-Log -Message "Successfully generated and validated master execution plan for all statements." -Level 'SUCCESS'
+            return $masterPlanXml
         } catch {
-            Write-Log -Message "The execution plan string returned by SQL Server is not valid XML. Error: $($_.Exception.Message)" -Level 'ERROR'
+            Write-Log -Message "The combined execution plan string is not valid XML. Error: $($_.Exception.Message)" -Level 'ERROR'
             return $null
         }
     }
@@ -656,7 +652,6 @@ function Get-ObjectsFromPlan {
             $table = $node.GetAttribute("Table")
             
             if ($table -notlike "#*" -and -not ([string]::IsNullOrWhiteSpace($db)) -and -not ([string]::IsNullOrWhiteSpace($schema))) {
-                # The check for 'sys' schema is removed. All objects are added.
                 $fullName = "$db.$schema.$table".Replace('[','').Replace(']','')
                 $uniqueObjectNames.Add($fullName) | Out-Null
             }
@@ -697,45 +692,55 @@ function Get-ObjectSchema {
     
     $fullObjectName = "[$SchemaName].[$ObjectName]"
     $schemaText = "--- Schema For Table: $SchemaName.$ObjectName ---`n"
-    $errorState = $false
+    $columnResult = $null
 
-    # Get Column Info
+    # Get Column Info - Primary Method
     try {
         $columnQuery = "SELECT name, system_type_name, max_length, [precision], scale, is_nullable FROM sys.dm_exec_describe_first_result_set(N'SELECT * FROM $fullObjectName', NULL, 0);"
         $columnResult = Invoke-Sqlcmd -ServerInstance $ServerInstance -Database $DatabaseName -TrustServerCertificate -Query $columnQuery -ErrorAction Stop
-        if ($columnResult -and $columnResult.Count -gt 0) {
-            $schemaText += "COLUMNS:`n"
-            foreach($col in $columnResult) {
-                $isNullable = if ($col.is_nullable) { 'YES' } else { 'NO' }
-                $schemaText += "name: $($col.name), type: $($col.system_type_name), length: $($col.max_length), nullable: $isNullable`n"
-            }
+    } catch {
+        Write-Log -Message "Primary schema collection method failed for '$fullObjectName'. Attempting fallback." -Level 'DEBUG'
+        # Fallback Method
+        try {
+            $fallbackQuery = @"
+SELECT c.name, t.name AS system_type_name, c.max_length, c.precision, c.scale, c.is_nullable
+FROM sys.columns c JOIN sys.types t ON c.user_type_id = t.user_type_id
+WHERE c.object_id = OBJECT_ID(@FullObjectName) ORDER BY c.column_id;
+"@
+            $params = @{ FullObjectName = "$DatabaseName.$fullObjectName" }
+            $columnResult = Invoke-Sqlcmd -ServerInstance $ServerInstance -Database $DatabaseName -TrustServerCertificate -Query $fallbackQuery -Variable $params -ErrorAction Stop
+        } catch {
+            Write-Log -Message "Could not get COLUMN schema for '$fullObjectName' in db '$DatabaseName' using any method. Error: $($_.Exception.Message)" -Level 'WARN'
         }
-    } catch { 
-        $warning = "Could not get COLUMN schema for '$fullObjectName' in db '$DatabaseName'."
-        Write-Log -Message $warning -Level 'WARN'; $errorState = $true
+    }
+
+    if ($columnResult) {
+        $schemaText += "COLUMNS:`n"
+        foreach($col in $columnResult) {
+            $isNullable = if ($col.is_nullable) { 'YES' } else { 'NO' }
+            $schemaText += "name: $($col.name), type: $($col.system_type_name), length: $($col.max_length), nullable: $isNullable`n"
+        }
     }
 
     # Get Index Info
-    if (-not $errorState) {
-        try {
-            $indexQuery = @"
+    try {
+        $indexQuery = @"
 SELECT i.name AS IndexName, i.type_desc AS IndexType,
 STUFF((SELECT ', ' + c.name FROM sys.index_columns ic JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 0 ORDER BY ic.key_ordinal FOR XML PATH('')), 1, 2, '') AS KeyColumns,
 STUFF((SELECT ', ' + c.name FROM sys.index_columns ic JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 1 ORDER BY ic.key_ordinal FOR XML PATH('')), 1, 2, '') AS IncludedColumns
 FROM sys.indexes i WHERE i.object_id = OBJECT_ID('$fullObjectName');
 "@
-            $indexResult = Invoke-Sqlcmd -ServerInstance $ServerInstance -Database $DatabaseName -TrustServerCertificate -Query $indexQuery -ErrorAction Stop
-            if ($indexResult -and $indexResult.Count -gt 0) {
-                $schemaText += "`nINDEXES:`n"
-                foreach($idx in $indexResult) {
-                    $idxLine = "IndexName: $($idx.IndexName), Type: $($idx.IndexType), KeyColumns: $($idx.KeyColumns)"
-                    if (-not [string]::IsNullOrWhiteSpace($idx.IncludedColumns)) { $idxLine += ", IncludedColumns: $($idx.IncludedColumns)" }
-                    $schemaText += $idxLine + "`n"
-                }
+        $indexResult = Invoke-Sqlcmd -ServerInstance $ServerInstance -Database $DatabaseName -TrustServerCertificate -Query $indexQuery -ErrorAction Stop
+        if ($indexResult -and $indexResult.Count -gt 0) {
+            $schemaText += "`nINDEXES:`n"
+            foreach($idx in $indexResult) {
+                $idxLine = "IndexName: $($idx.IndexName), Type: $($idx.IndexType), KeyColumns: $($idx.KeyColumns)"
+                if (-not [string]::IsNullOrWhiteSpace($idx.IncludedColumns)) { $idxLine += ", IncludedColumns: $($idx.IncludedColumns)" }
+                $schemaText += $idxLine + "`n"
             }
-        } catch {
-            Write-Log -Message "Could not get INDEX information for '$fullObjectName'." -Level 'WARN'
         }
+    } catch {
+        Write-Log -Message "Could not get INDEX information for '$fullObjectName'." -Level 'WARN'
     }
     
     return $schemaText + "`n"
@@ -895,7 +900,7 @@ Timestamp: $(Get-Date)
 # --- Main Application Logic ---
 function Start-Optimus {
     # Define the current version of the script in one place.
-    $script:CurrentVersion = "1.4-preview"
+    $script:CurrentVersion = "1.5-preview"
 
     if ($DebugMode) { Write-Log -Message "Starting Optimus v$($script:CurrentVersion) in Debug Mode." -Level 'DEBUG'}
 
