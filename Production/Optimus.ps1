@@ -42,11 +42,11 @@
 .NOTES
     Designer: Brennan Webb
     Script Engine: Gemini
-    Version: 1.3-preview
+    Version: 1.2-preview
     Created: 2025-06-21
     Modified: 2025-06-21
     Change Log:
-    - v1.3-preview: Renamed function to use an approved PowerShell verb (Invoke-OptimusVersionCheck).
+    - v1.2-preview: Renamed function to use an approved PowerShell verb (Invoke-OptimusVersionCheck).
     - v1.1-preview: Added an automatic version check at startup.
     - v1.0-preview: Initial preview release. Re-versioned from legacy builds.
     Powershell Version: 5.1+
@@ -880,7 +880,7 @@ Timestamp: $(Get-Date)
 # --- Main Application Logic ---
 function Start-Optimus {
     # Define the current version of the script in one place.
-    $script:CurrentVersion = "1.3-preview"
+    $script:CurrentVersion = "1.2-preview"
 
     if ($DebugMode) { Write-Log -Message "Starting Optimus v$($script:CurrentVersion) in Debug Mode." -Level 'DEBUG'}
 
