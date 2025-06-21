@@ -42,10 +42,12 @@
 .NOTES
     Designer: Brennan Webb
     Script Engine: Gemini
-    Version: 1.7-preview
+    Version: 1.8-preview
     Created: 2025-06-21
     Modified: 2025-06-21
     Change Log:
+    - v1.8-preview: Implemented a one-time, persistent model selection configuration.
+    - v1.8-preview: Updated reset logic to include clearing the selected model.
     - v1.7-preview: Corrected and hardened the AI prompt to ensure the full original script is always returned.
     - v1.6-preview: Added logic to skip schema collection for the mssqlsystemresource database.
     - v1.5-preview: Modified plan collection to capture all statements in a script.
@@ -136,7 +138,7 @@ function Reset-OptimusConfiguration {
     }
 
     Write-Log -Message "`n--- Optimus Configuration Reset ---" -Level 'WARN'
-    Write-Log -Message "[1] Reset Configuration Only (deletes API key and server list)" -Level 'PROMPT'
+    Write-Log -Message "[1] Reset Configuration Only (deletes API key, server list, and model selection)" -Level 'PROMPT'
     Write-Log -Message "[2] Remove all Analysis Reports" -Level 'PROMPT'
     Write-Log -Message "[3] Full Reset (deletes configuration AND all past analysis reports)" -Level 'PROMPT'
     Write-Log -Message "[Q] Quit / Cancel" -Level 'PROMPT'
@@ -148,7 +150,7 @@ function Reset-OptimusConfiguration {
 
     switch ($choice) {
         '1' {
-            Write-Log -Message "Are you sure you want to delete the API key and server list? (Y/N): " -Level 'PROMPT' -NoNewLine
+            Write-Log -Message "Are you sure you want to delete the API key, server list, and model selection? (Y/N): " -Level 'PROMPT' -NoNewLine
             $confirm = Read-Host
             Write-Host ""
             Write-Log -Message "User Input: $confirm" -Level 'DEBUG'
@@ -157,9 +159,11 @@ function Reset-OptimusConfiguration {
                     $serverFile = Join-Path -Path $configDir -ChildPath "servers.json"
                     $apiKeyFile = Join-Path -Path $configDir -ChildPath "api.config"
                     $lastPathFile = Join-Path -Path $configDir -ChildPath "lastpath.config"
+                    $modelFile = Join-Path -Path $configDir -ChildPath "model.config"
                     if (Test-Path $serverFile) { Remove-Item -Path $serverFile -Force; Write-Log -Message "Server list deleted." -Level 'DEBUG' }
                     if (Test-Path $apiKeyFile) { Remove-Item -Path $apiKeyFile -Force; Write-Log -Message "API Key deleted." -Level 'DEBUG' }
                     if (Test-Path $lastPathFile) { Remove-Item -Path $lastPathFile -Force; Write-Log -Message "Last path config deleted." -Level 'DEBUG' }
+                    if (Test-Path $modelFile) { Remove-Item -Path $modelFile -Force; Write-Log -Message "Model configuration deleted." -Level 'DEBUG' }
                     Write-Log -Message "Configuration reset successfully." -Level 'SUCCESS'
                     return $true
                 } catch {
@@ -227,6 +231,7 @@ function Initialize-Configuration {
         $serverFile = Join-Path -Path $configDir -ChildPath "servers.json"
         $apiKeyFile = Join-Path -Path $configDir -ChildPath "api.config"
         $lastPathFile = Join-Path -Path $configDir -ChildPath "lastpath.config"
+        $modelFile = Join-Path -Path $configDir -ChildPath "model.config"
 
         foreach($dir in @($configDir, $analysisBaseDir)){ if (-not (Test-Path -Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null } }
         if (-not (Test-Path -Path $serverFile)) { Set-Content -Path $serverFile -Value "[]" | Out-Null }
@@ -236,6 +241,7 @@ function Initialize-Configuration {
             ServerFile      = $serverFile
             ApiKeyFile      = $apiKeyFile
             LastPathFile    = $lastPathFile
+            ModelFile       = $modelFile
         }
         Write-Log -Message "Configuration initialized successfully." -Level 'DEBUG'
         return $true
@@ -287,6 +293,48 @@ function Get-And-Set-ApiKey {
             Write-Log -Message "User Input: $retry" -Level 'DEBUG'
             if ($retry -notmatch '^[Yy]$') { return $false }
         }
+    }
+}
+
+function Get-And-Set-Model {
+    Write-Log -Message "Entering Function: Get-And-Set-Model" -Level 'DEBUG'
+    $modelFile = $script:OptimusConfig.ModelFile
+
+    if (Test-Path -Path $modelFile) {
+        $modelName = Get-Content -Path $modelFile
+        if (-not [string]::IsNullOrWhiteSpace($modelName)) {
+            Write-Log -Message "Using configured model: '$modelName'" -Level 'DEBUG'
+            return $modelName
+        }
+    }
+
+    Write-Log -Message "`nPlease select the Gemini model to use for all future analyses:" -Level 'INFO'
+    Write-Log -Message "This can be changed later using the -ResetConfiguration parameter." -Level 'INFO'
+    Write-Log -Message "   [1] Gemini 1.5 Flash (Fastest, good for general use - Default)" -Level 'PROMPT'
+    Write-Log -Message "   [2] Gemini 2.5 Flash (Next-gen speed and efficiency)" -Level 'PROMPT'
+    Write-Log -Message "   [3] Gemini 2.5 Pro (Most powerful, for complex analysis)" -Level 'PROMPT'
+    
+    $modelChoice = $null
+    while (-not $modelChoice) {
+        Write-Log -Message "   Enter your choice: " -Level 'PROMPT' -NoNewLine
+        $choice = Read-Host
+        Write-Host ""
+        Write-Log -Message "User Input: $choice" -Level 'DEBUG'
+        switch ($choice) {
+            '1' { $modelChoice = 'gemini-1.5-flash-latest' }
+            '2' { $modelChoice = 'gemini-2.5-flash' }
+            '3' { $modelChoice = 'gemini-2.5-pro' }
+            default { Write-Log -Message "Invalid selection. Please enter 1, 2, or 3." -Level 'ERROR' }
+        }
+    }
+
+    try {
+        Set-Content -Path $modelFile -Value $modelChoice
+        Write-Log -Message "Model set to '$modelChoice'. This will be used for all future runs." -Level 'SUCCESS'
+        return $modelChoice
+    } catch {
+        Write-Log -Message "Failed to save model configuration: $($_.Exception.Message)" -Level 'ERROR'
+        return $null
     }
 }
 #endregion
@@ -750,6 +798,7 @@ FROM sys.indexes i WHERE i.object_id = OBJECT_ID('$fullObjectName');
 
 function Invoke-GeminiAnalysis {
     param(
+        [string]$ModelName,
         [securestring]$ApiKey, 
         [string]$FullSqlText, 
         [string]$ConsolidatedSchema, 
@@ -760,11 +809,14 @@ function Invoke-GeminiAnalysis {
     Write-Log -Message "Sending full script to Gemini for holistic analysis..." -Level 'INFO'
 
     $plainTextApiKey = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto([System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($ApiKey))
-    $uri = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=$plainTextApiKey"
+    $uri = "https://generativelanguage.googleapis.com/v1beta/models/$($ModelName):generateContent?key=$plainTextApiKey"
 
     # --- Start of Modified Prompt ---
     $prompt = @"
 You are an expert T-SQL performance tuning assistant. You will be provided with the specific SQL Server version. You MUST ensure that any T-SQL syntax you generate is valid for that version.
+
+Your Core Mandate:
+Your ONLY task is to return the complete, original T-SQL script provided below. You will add T-SQL comment blocks containing your analysis directly above any statements you identify for improvement. Think of this as a text transformation task: the original text is your input, and the identical text with your added comments is the only output.
 
 Your Golden Rule:
 You MUST NOT change the original T-SQL code. The final output must contain the original, unmodified T-SQL script with only your comments added.
@@ -902,7 +954,7 @@ Timestamp: $(Get-Date)
 # --- Main Application Logic ---
 function Start-Optimus {
     # Define the current version of the script in one place.
-    $script:CurrentVersion = "1.7-preview"
+    $script:CurrentVersion = "1.8-preview"
 
     if ($DebugMode) { Write-Log -Message "Starting Optimus v$($script:CurrentVersion) in Debug Mode." -Level 'DEBUG'}
 
@@ -922,12 +974,17 @@ function Start-Optimus {
             return $false
         }
         
-        # Call the version check after internet is confirmed
         Invoke-OptimusVersionCheck -CurrentVersion $script:CurrentVersion
 
         if (-not (Test-SqlServerModule)) { return $false }
         if (-not (Get-And-Set-ApiKey)) {
             Write-Log -Message "Exiting due to missing API key." -Level 'ERROR'
+            return $false
+        }
+        
+        $script:ChosenModel = Get-And-Set-Model
+        if (-not $script:ChosenModel) {
+            Write-Log -Message "Exiting due to no model being selected." -Level 'ERROR'
             return $false
         }
         return $true
@@ -1046,7 +1103,7 @@ function Start-Optimus {
                 try { $consolidatedSchema | Set-Content -Path $schemaPath -Encoding UTF8; Write-Log -Message "Consolidated schema saved." -Level 'DEBUG' } catch { Write-Log -Message "Could not save consolidated schema file." -Level 'WARN' }
 
                 # 4. Make single "Omnibus" call to AI
-                $finalScript = Invoke-GeminiAnalysis -ApiKey $script:GeminiApiKey -FullSqlText $sqlQueryText -ConsolidatedSchema $consolidatedSchema -MasterPlanXml $masterPlanXml -SqlServerVersion $sqlVersion
+                $finalScript = Invoke-GeminiAnalysis -ApiKey $script:GeminiApiKey -FullSqlText $sqlQueryText -ConsolidatedSchema $consolidatedSchema -MasterPlanXml $masterPlanXml -SqlServerVersion $sqlVersion -ModelName $script:ChosenModel
                 
                 # 5. Process and save the final result
                 if ($finalScript) {
