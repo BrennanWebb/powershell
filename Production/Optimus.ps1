@@ -42,10 +42,11 @@
 .NOTES
     Designer: Brennan Webb
     Script Engine: Gemini
-    Version: 1.3-preview
+    Version: 1.4-preview
     Created: 2025-06-21
     Modified: 2025-06-21
     Change Log:
+    - v1.4-preview: Removed the logic that excludes 'sys' schema objects from analysis.
     - v1.3-preview: Added an option to Reset-OptimusConfiguration to remove only analysis reports.
     - v1.2-preview: Renamed function to use an approved PowerShell verb (Invoke-OptimusVersionCheck).
     - v1.1-preview: Added an automatic version check at startup.
@@ -172,7 +173,7 @@ function Reset-OptimusConfiguration {
             Write-Log -Message "User Input: $confirm" -Level 'DEBUG'
             if ($confirm -match '^[Yy]$') {
                 try {
-                    $analysisDir = Join-Path -Path $configDir -ChildPath "Analyses"
+                    $analysisDir = Join-Path -Path $configDir -ChildPath "Analysis"
                     if (Test-Path $analysisDir) {
                         Remove-Item -Path $analysisDir -Recurse -Force
                         Write-Log -Message "All analysis reports have been deleted." -Level 'SUCCESS'
@@ -218,7 +219,7 @@ function Initialize-Configuration {
     try {
         $userProfile = $env:USERPROFILE
         $configDir = Join-Path -Path $userProfile -ChildPath ".optimus"
-        $analysisBaseDir = Join-Path -Path $configDir -ChildPath "Analyses"
+        $analysisBaseDir = Join-Path -Path $configDir -ChildPath "Analysis"
         $serverFile = Join-Path -Path $configDir -ChildPath "servers.json"
         $apiKeyFile = Join-Path -Path $configDir -ChildPath "api.config"
         $lastPathFile = Join-Path -Path $configDir -ChildPath "lastpath.config"
@@ -648,28 +649,17 @@ function Get-ObjectsFromPlan {
     try {
         $objectNodes = $MasterPlan.SelectNodes("//sql:Object", $NamespaceManager)
         $uniqueObjectNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-        $skippedSystemObjectCount = 0
 
         foreach($node in $objectNodes) {
             $db = $node.GetAttribute("Database")
             $schema = $node.GetAttribute("Schema")
             $table = $node.GetAttribute("Table")
             
-            # We only care about nodes that are fully qualified and not temp tables
             if ($table -notlike "#*" -and -not ([string]::IsNullOrWhiteSpace($db)) -and -not ([string]::IsNullOrWhiteSpace($schema))) {
-                # Check if the object belongs to the 'sys' schema and skip it if so
-                if ($schema -eq '[sys]' -or $schema -eq 'sys') {
-                    $skippedSystemObjectCount++
-                } else {
-                    $fullName = "$db.$schema.$table".Replace('[','').Replace(']','')
-                    $uniqueObjectNames.Add($fullName) | Out-Null
-                }
+                # The check for 'sys' schema is removed. All objects are added.
+                $fullName = "$db.$schema.$table".Replace('[','').Replace(']','')
+                $uniqueObjectNames.Add($fullName) | Out-Null
             }
-        }
-        
-        # If any system objects were found and skipped, notify the user.
-        if ($skippedSystemObjectCount -gt 0) {
-            Write-Log -Message "Note: Skipped analysis of $skippedSystemObjectCount internal system object(s) to focus on user code." -Level 'INFO'
         }
 
         $finalList = $uniqueObjectNames | Sort-Object
@@ -687,7 +677,7 @@ function Get-ObjectsFromPlan {
             Write-Log -Message "The following unique user objects were found in the execution plan:`n$tableOutput" -Level 'DEBUG'
         }
 
-        Write-Log -Message "Identified $($finalList.Count) unique user objects for schema collection." -Level 'SUCCESS'
+        Write-Log -Message "Identified $($finalList.Count) unique objects for schema collection." -Level 'SUCCESS'
         Write-Log -Message "Returning from Get-ObjectsFromPlan." -Level 'DEBUG'
         return $finalList
     } catch {
@@ -905,7 +895,7 @@ Timestamp: $(Get-Date)
 # --- Main Application Logic ---
 function Start-Optimus {
     # Define the current version of the script in one place.
-    $script:CurrentVersion = "1.3-preview"
+    $script:CurrentVersion = "1.4-preview"
 
     if ($DebugMode) { Write-Log -Message "Starting Optimus v$($script:CurrentVersion) in Debug Mode." -Level 'DEBUG'}
 
