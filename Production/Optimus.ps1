@@ -42,10 +42,12 @@
 .NOTES
     Designer: Brennan Webb
     Script Engine: Gemini
-    Version: 1.5-preview
+    Version: 1.7-preview
     Created: 2025-06-21
     Modified: 2025-06-21
     Change Log:
+    - v1.7-preview: Corrected and hardened the AI prompt to ensure the full original script is always returned.
+    - v1.6-preview: Added logic to skip schema collection for the mssqlsystemresource database.
     - v1.5-preview: Modified plan collection to capture all statements in a script.
     - v1.5-preview: Hardened schema collection to support system tables.
     - v1.4-preview: Removed the logic that excludes 'sys' schema objects from analysis.
@@ -797,10 +799,10 @@ Every analysis comment block you add MUST use the following structure. The block
 */
 
 Final Output Rules:
-- Your entire response must be ONLY the T-SQL script text.
-- If you add comments, they must be placed directly above the relevant statement in the original script using the format specified above.
-- If the entire script is already optimal and you have no comments to add, return only the original, unmodified T-SQL script text.
-- Do not include any conversational text, greetings, or explanations outside of the T-SQL comments.
+- Your response MUST be the complete, original T-SQL script from start to finish. Do not omit any part of the original script for any reason.
+- For statements that require improvement, insert your formatted analysis comment block directly above the statement.
+- For statements that are already optimal, include the original T-SQL for that statement without any comment.
+- Your entire response must be ONLY the T-SQL script text. Do not include any conversational text, greetings, or explanations outside of the T-SQL comments.
 
 --- SQL SERVER VERSION ---
 $SqlServerVersion
@@ -900,7 +902,7 @@ Timestamp: $(Get-Date)
 # --- Main Application Logic ---
 function Start-Optimus {
     # Define the current version of the script in one place.
-    $script:CurrentVersion = "1.5-preview"
+    $script:CurrentVersion = "1.7-preview"
 
     if ($DebugMode) { Write-Log -Message "Starting Optimus v$($script:CurrentVersion) in Debug Mode." -Level 'DEBUG'}
 
@@ -1018,6 +1020,12 @@ function Start-Optimus {
 
                     foreach ($dbGroup in $objectsByDb) {
                         $dbName = $dbGroup.Name
+                        # Skip the hidden mssqlsystemresource database as it cannot be queried directly
+                        if ($dbName -eq 'mssqlsystemresource') {
+                            Write-Log -Message "Skipping schema collection for internal database: 'mssqlsystemresource'." -Level 'DEBUG'
+                            continue
+                        }
+                        
                         Write-Log -Message "Querying database '$dbName'..." -Level 'INFO'
                         foreach ($objName in $dbGroup.Group) {
                             $parts = $objName.Split('.')
