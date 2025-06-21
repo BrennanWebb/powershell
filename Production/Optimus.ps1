@@ -42,10 +42,12 @@
 .NOTES
     Designer: Brennan Webb
     Script Engine: Gemini
-    Version: 1.0-preview
+    Version: 1.3-preview
     Created: 2025-06-21
     Modified: 2025-06-21
     Change Log:
+    - v1.3-preview: Renamed function to use an approved PowerShell verb (Invoke-OptimusVersionCheck).
+    - v1.1-preview: Added an automatic version check at startup.
     - v1.0-preview: Initial preview release. Re-versioned from legacy builds.
     Powershell Version: 5.1+
 #>
@@ -260,6 +262,45 @@ function Get-And-Set-ApiKey {
 #endregion
 
 #region Environment & Prerequisite Checks
+function Invoke-OptimusVersionCheck {
+    param(
+        [string]$CurrentVersion
+    )
+    Write-Log -Message "Entering Function: Invoke-OptimusVersionCheck" -Level 'DEBUG'
+    
+    try {
+        # The URL for the raw script file on GitHub
+        $repoUrl = "https://raw.githubusercontent.com/BrennanWebb/powershell/main/Production/Optimus.ps1"
+        Write-Log -Message "Checking for new version at: $repoUrl" -Level 'DEBUG'
+
+        # Download the latest script content as a string
+        $webContent = Invoke-WebRequest -Uri $repoUrl -UseBasicParsing -TimeoutSec 10 | Select-Object -ExpandProperty Content
+
+        # Use regex to find the version number in the script's header
+        if ($webContent -match "Version:\s*([^\s]+)") {
+            $latestVersionStr = $matches[1]
+            Write-Log -Message "Latest version found online: '$latestVersionStr'" -Level 'DEBUG'
+            
+            # Sanitize versions for comparison by removing suffixes like '-preview'
+            $cleanCurrent = ($CurrentVersion -split '-')[0]
+            $cleanLatest = ($latestVersionStr -split '-')[0]
+
+            # Compare the versions
+            if ([System.Version]$cleanLatest -gt [System.Version]$cleanCurrent) {
+                Write-Log -Message "A new version of Optimus is available! (Current: v$CurrentVersion, Latest: v$latestVersionStr)" -Level 'WARN'
+                Write-Log -Message "You can download it from: https://github.com/BrennanWebb/powershell/blob/main/Production/Optimus.ps1" -Level 'WARN'
+            } else {
+                Write-Log -Message "Optimus is up to date." -Level 'DEBUG'
+            }
+        }
+    }
+    catch {
+        # Fail silently if the check doesn't work. This is a non-essential feature.
+        Write-Log -Message "Could not check for a new version. This can happen if GitHub is unreachable or there is no internet connection." -Level 'DEBUG'
+        Write-Log -Message "Version check error: $($_.Exception.Message)" -Level 'DEBUG'
+    }
+}
+
 function Test-PowerShellVersion {
     Write-Log -Message "Entering Function: Test-PowerShellVersion" -Level 'DEBUG'
     $currentVersion = $PSVersionTable.PSVersion
@@ -838,7 +879,10 @@ Timestamp: $(Get-Date)
 
 # --- Main Application Logic ---
 function Start-Optimus {
-    if ($DebugMode) { Write-Log -Message "Starting Optimus v1.0-preview in Debug Mode." -Level 'DEBUG'}
+    # Define the current version of the script in one place.
+    $script:CurrentVersion = "1.3-preview"
+
+    if ($DebugMode) { Write-Log -Message "Starting Optimus v$($script:CurrentVersion) in Debug Mode." -Level 'DEBUG'}
 
     # Group prerequisite checks
     $checksPassed = {
@@ -855,6 +899,10 @@ function Start-Optimus {
             Write-Log -Message "Exiting due to no internet connection or user choice." -Level 'ERROR'
             return $false
         }
+        
+        # Call the version check after internet is confirmed
+        Invoke-OptimusVersionCheck -CurrentVersion $script:CurrentVersion
+
         if (-not (Test-SqlServerModule)) { return $false }
         if (-not (Get-And-Set-ApiKey)) {
             Write-Log -Message "Exiting due to missing API key." -Level 'ERROR'
@@ -865,7 +913,7 @@ function Start-Optimus {
 
     if (-not $checksPassed) { return }
 
-    Write-Log -Message "`n--- Welcome to Optimus v1.0-preview ---" -Level 'SUCCESS'
+    Write-Log -Message "`n--- Welcome to Optimus v$($script:CurrentVersion) ---" -Level 'SUCCESS'
     if (-not $DebugMode) { Write-Log -Message "All prerequisite checks passed." -Level 'SUCCESS' }
     
     do { # Outer loop to allow running multiple batches
@@ -915,7 +963,7 @@ function Start-Optimus {
 
                 # Set up the log file path for this specific analysis
                 $script:LogFilePath = Join-Path -Path $script:AnalysisPath -ChildPath "ExecutionLog.txt"
-                "# Optimus v1.0-preview Execution Log | File: $fileNameOnly | Started: $(Get-Date)" | Out-File -FilePath $script:LogFilePath -Encoding utf8
+                "# Optimus v$($script:CurrentVersion) Execution Log | File: $fileNameOnly | Started: $(Get-Date)" | Out-File -FilePath $script:LogFilePath -Encoding utf8
                 
                 Write-Log -Message "Created analysis directory: '$($script:AnalysisPath)'" -Level 'INFO'
                 $sqlVersion = Get-SqlServerVersion -ServerInstance $selectedServer
@@ -970,7 +1018,7 @@ function Start-Optimus {
                 try { $consolidatedSchema | Set-Content -Path $schemaPath -Encoding UTF8; Write-Log -Message "Consolidated schema saved." -Level 'DEBUG' } catch { Write-Log -Message "Could not save consolidated schema file." -Level 'WARN' }
 
                 # 4. Make single "Omnibus" call to AI
-                $finalScript = Invoke-GeminiAnalysis -ApiKey $script:GeminiApiKey -FullSqlText $sqlQueryText -ConsolidatedSchema $consolidatedschema -MasterPlanXml $masterPlanXml -SqlServerVersion $sqlVersion
+                $finalScript = Invoke-GeminiAnalysis -ApiKey $script:GeminiApiKey -FullSqlText $sqlQueryText -ConsolidatedSchema $consolidatedSchema -MasterPlanXml $masterPlanXml -SqlServerVersion $sqlVersion
                 
                 # 5. Process and save the final result
                 if ($finalScript) {
