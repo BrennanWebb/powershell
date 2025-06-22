@@ -14,10 +14,12 @@
 .NOTES
     Designer: Brennan Webb
     Script Engine: Gemini
-    Version: 3.0
+    Version: 3.2
     Created: 2025-06-21
     Modified: 2025-06-22
     Change Log:
+    - v3.2: Refactored Write-Log to pre-build UI elements on the main thread before passing them to the dispatcher. This is the correct way to handle cross-thread UI updates and resolves all previous errors.
+    - v3.1: (Faulty Attempt) Corrected a WPF dispatcher issue by modifying the Write-Log function to use the $using scope modifier, resolving an "InvokeAsync" overload error.
     - v3.0: Complete overhaul to implement a WPF graphical user interface for an improved user experience.
     - v3.0: Refactored core logic to decouple it from the UI for better maintainability.
     - v3.0: Enhanced logging to support real-time updates to the UI's output window.
@@ -44,7 +46,7 @@ param (
 )
 
 # --- SCRIPT-WIDE CONFIGURATION ---
-$script:CurrentVersion = "3.0"
+$script:CurrentVersion = "3.2"
 $script:uiMode = $true # Flag to indicate we are running in UI mode.
 
 #region Centralized Logging
@@ -91,17 +93,18 @@ function Write-Log {
     if ($script:uiMode) {
         # UI Logging requires using the dispatcher to safely update the UI from the script's thread.
         try {
-            $script:TxtOutputLog.Dispatcher.InvokeAsync({
-                param($logMsg, $logColor)
-                
-                $run = New-Object System.Windows.Documents.Run($logMsg + "`n")
-                $run.Foreground = $logColor
-                $paragraph = New-Object System.Windows.Documents.Paragraph($run)
-                $paragraph.Margin = "0"
+            # Create the UI elements on the main thread first.
+            $run = New-Object System.Windows.Documents.Run($consoleMessage + "`n")
+            $run.Foreground = $color
+            $paragraph = New-Object System.Windows.Documents.Paragraph($run)
+            $paragraph.Margin = "0"
 
+            # Use the dispatcher ONLY to add the pre-constructed elements to the UI.
+            # The $paragraph variable is captured from the parent scope, which is valid here.
+            $script:TxtOutputLog.Dispatcher.InvokeAsync({
                 $script:TxtOutputLog.Document.Blocks.Add($paragraph)
                 $script:TxtOutputLog.ScrollToEnd()
-            }, "Normal", @($consoleMessage, $color)) | Out-Null
+            }, [System.Windows.Threading.DispatcherPriority]::Normal) | Out-Null
         } catch {
             Write-Warning "Failed to write to UI log: $($_.Exception.Message)"
         }
@@ -956,7 +959,7 @@ function Start-OptimusGUI {
     
     $MenuExit.Add_Click({ $window.Close() })
     $MenuAbout.Add_Click({ [System.Windows.MessageBox]::Show("Optimus T-SQL Tuning Advisor`nVersion: $($script:CurrentVersion)`nDesigner: Brennan Webb", "About Optimus", "OK", "Information") })
-    $MenuReset.Add_Click({ Reset-OptimusConfiguration })
+    $MenuReset.Add__Click({ Reset-OptimusConfiguration })
     $MenuSetApiKey.Add_Click({ Get-And-Set-ApiKey -ForcePrompt })
     $MenuSetModel.Add_Click({ 
         $script:ChosenModel = Get-And-Set-Model -ForcePrompt
