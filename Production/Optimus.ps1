@@ -42,11 +42,10 @@
 .NOTES
     Designer: Brennan Webb
     Script Engine: Gemini
-    Version: 3.0-preview
+    Version: 2.0
     Created: 2025-06-21
     Modified: 2025-06-21
     Change Log:
-    - v3.0-preview: Replaced Invoke-RestMethod with a streaming API call to provide real-time analysis feedback.
     - v2.0: Updated output directory to be segmented by model name.
     - v2.0: Promoted to major version after preview cycle.
     - v1.9-preview: Updated AI prompt to explicitly forbid Markdown within recommendation comments.
@@ -813,7 +812,7 @@ function Invoke-GeminiAnalysis {
     Write-Log -Message "Sending full script to Gemini for holistic analysis..." -Level 'INFO'
 
     $plainTextApiKey = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto([System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($ApiKey))
-    $uri = "https://generativelanguage.googleapis.com/v1beta/models/$($ModelName):streamGenerateContent?key=$plainTextApiKey&alt=sse"
+    $uri = "https://generativelanguage.googleapis.com/v1beta/models/$($ModelName):generateContent?key=$plainTextApiKey"
 
     # --- Start of Modified Prompt ---
     $prompt = @"
@@ -880,72 +879,23 @@ $MasterPlanXml
     $bodyObject = @{ contents = @( @{ parts = @( @{ text = $prompt } ) } ) }
     $bodyJson = $bodyObject | ConvertTo-Json -Depth 10
 
-    $finalScriptBuilder = [System.Text.StringBuilder]::new()
-    $streamReader = $null
-    $responseStream = $null
-
     try {
-        $webRequest = [System.Net.WebRequest]::Create($uri)
-        $webRequest.Method = "POST"
-        $webRequest.ContentType = "application/json"
-        $webRequest.Timeout = 600000 # 10 minute timeout for long analyses
-
-        $requestBytes = [System.Text.Encoding]::UTF8.GetBytes($bodyJson)
-        $webRequest.ContentLength = $requestBytes.Length
-
-        $requestStream = $webRequest.GetRequestStream()
-        $requestStream.Write($requestBytes, 0, $requestBytes.Length)
-        $requestStream.Close()
-
-        $response = $webRequest.GetResponse()
-        $responseStream = $response.GetResponseStream()
-        $streamReader = New-Object System.IO.StreamReader($responseStream)
-
-        Write-Log -Message "Connection established. Receiving analysis stream from Gemini..." -Level 'INFO'
+        $response = Invoke-RestMethod -Uri $uri -Method Post -Body $bodyJson -ContentType 'application/json' -ErrorAction Stop
+        $rawAiResponse = $response.candidates[0].content.parts[0].text
+        Write-Log -Message "Successfully received raw response from Gemini API." -Level 'DEBUG'
         
-        while (-not $streamReader.EndOfStream) {
-            $line = $streamReader.ReadLine()
-            if ($line.StartsWith("data: ")) {
-                $jsonData = $line.Substring(6)
-                try {
-                    $data = $jsonData | ConvertFrom-Json -ErrorAction Stop
-                    if ($data.candidates[0].content.parts[0].text) {
-                        $textChunk = $data.candidates[0].content.parts[0].text
-                        [void]$finalScriptBuilder.Append($textChunk)
-                        Write-Host $textChunk -ForegroundColor Yellow -NoNewline
-                        Write-Log -Message "STREAM: $($textChunk)" -Level 'DEBUG'
-                    }
-                }
-                catch {
-                    Write-Log -Message "Could not parse a JSON data chunk from the stream. Raw data: '$jsonData'" -Level 'DEBUG'
-                }
-            }
-        }
+        $cleanedScript = $rawAiResponse -replace '(?i)^```sql\s*','' -replace '```\s*$',''
+        Write-Log -Message "Cleaned response received from AI." -Level 'DEBUG'
         
-        Write-Host "" # Add a newline for clean console formatting after the stream
-        $finalScript = $finalScriptBuilder.ToString()
-        $cleanedScript = $finalScript -replace '(?i)^```sql\s*','' -replace '```\s*$',''
-        
-        Write-Log -Message "AI analysis stream complete." -Level 'SUCCESS'
+        Write-Log -Message "AI analysis complete." -Level 'SUCCESS'
         return $cleanedScript
-    }
-    catch {
+    } catch {
         Write-Log -Message "Failed to get response from Gemini API." -Level 'ERROR'
-        if ($_.Exception.Response) {
-            $errorResponseStream = $_.Exception.Response.GetResponseStream()
-            $errorStreamReader = New-Object System.IO.StreamReader($errorResponseStream)
-            $errorBody = $errorStreamReader.ReadToEnd()
-            Write-Log -Message "API Error Details: $errorBody" -Level 'ERROR'
-            $errorStreamReader.Close()
-        } else {
-            Write-Log -Message "An unexpected error occurred: $($_.Exception.Message)" -Level 'ERROR'
-        }
+        $errorDetails = $_.Exception.Response.GetResponseStream()
+        $streamReader = New-Object System.IO.StreamReader($errorDetails)
+        $errorText = $streamReader.ReadToEnd()
+        Write-Log -Message "API Error Details: $errorText" -Level 'ERROR'
         return $null
-    }
-    finally {
-        if ($streamReader) { $streamReader.Close() }
-        if ($responseStream) { $responseStream.Close() }
-        Write-Log -Message "Closed API response streams." -Level 'DEBUG'
     }
 }
 
@@ -1007,7 +957,7 @@ Timestamp: $(Get-Date)
 # --- Main Application Logic ---
 function Start-Optimus {
     # Define the current version of the script in one place.
-    $script:CurrentVersion = "3.0-preview"
+    $script:CurrentVersion = "2.0"
 
     if ($DebugMode) { Write-Log -Message "Starting Optimus v$($script:CurrentVersion) in Debug Mode." -Level 'DEBUG'}
 
