@@ -842,13 +842,19 @@ Every analysis comment block you add MUST use the following structure. The block
 
 [1] Recommendation
     - Problem: A brief, clear explanation of the first performance issue.
-    - Recommended Code: The suggested T-SQL query rewrite or DDL syntax for the first issue.
-    - Reasoning: An explanation of why this specific recommendation improves performance.
 
+    - Recommended Code: The suggested T-SQL query rewrite or DDL syntax for the first issue.
+
+    - Reasoning: An explanation of why this specific recommendation improves performance.
+    
+    
 [2] Recommendation
     - Problem: A brief, clear explanation of a second, distinct performance issue.
+
     - Recommended Code: The alternative or additional code for the second recommendation.
+
     - Reasoning: An explanation of why this second recommendation is also a valid performance improvement.
+
 
 (Add more numbered recommendations as needed for the same statement)
 */
