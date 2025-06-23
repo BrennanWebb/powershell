@@ -3,18 +3,22 @@
     Optimus is a T-SQL tuning advisor that leverages the Gemini AI for performance recommendations.
 
 .DESCRIPTION
-    This script performs a holistic analysis of a T-SQL file. It can process a single file, a list of files, or all .sql files
-    in a specified folder. It generates a master execution plan to validate syntax and identify database objects. It then 
+    This script performs a holistic analysis of a T-SQL query. It can process a T-SQL script from a single file, a list of files, all .sql files
+    in a specified folder, or a raw T-SQL string. It generates a master execution plan to validate syntax and identify database objects. It then 
     queries each required database to build a comprehensive schema document for all user-defined objects. All execution steps, 
     messages, and recommendations are recorded in a detailed log file for each analysis.
 
 .PARAMETER SQLFile
     The path to one or more .sql files to be analyzed. For multiple files, provide a comma-separated list. This parameter
-    cannot be used with -FolderPath.
+    cannot be used with -FolderPath or -AdhocSQL.
 
 .PARAMETER FolderPath
     The path to a single folder. The script will analyze all .sql files found in this folder (non-recursively). 
-    This parameter cannot be used with -SQLFile.
+    This parameter cannot be used with -SQLFile or -AdhocSQL.
+
+.PARAMETER AdhocSQL
+    A string containing the T-SQL query to be analyzed. This is useful for passing queries directly from other applications.
+    This parameter cannot be used with -SQLFile or -FolderPath.
 
 .PARAMETER ServerName
     An optional parameter to specify the SQL Server instance for the analysis, bypassing the interactive menu.
@@ -36,15 +40,20 @@
 
 .EXAMPLE
     .\Optimus.ps1 -FolderPath "C:\My TSQL Projects\Batch1" -ServerName "PROD-DB01\SQL2022"
-    Runs a fully automated analysis on all .sql files in the folder against the specified server, using the default 'Estimated' plan.
+    Runs a fully automated analysis on all .sql files in the folder against the specified server.
+
+.EXAMPLE
+    .\Optimus.ps1 -AdhocSQL "SELECT * FROM Sales.SalesOrderHeader WHERE OrderDate > '2011-01-01'" -ServerName "PROD-DB01\SQL2022"
+    Runs a fully automated analysis on the provided T-SQL string.
 
 .NOTES
     Designer: Brennan Webb
     Script Engine: Gemini
-    Version: 2.2
+    Version: 2.3
     Created: 2025-06-21
     Modified: 2025-06-23
     Change Log:
+    - v2.3: Added -AdhocSQL parameter and 'Adhoc' parameter set to allow for direct T-SQL string analysis. Refactored input handling.
     - v2.2: Added -ServerName parameter to allow for non-interactive server selection, enabling full automation.
     - v2.1: Modified plan selection to be non-interactive for automated runs. It now defaults to 'Estimated' plan unless -UseActualPlan is specified.
     - v2.0: Updated output directory to be segmented by model name.
@@ -70,6 +79,9 @@ param (
 
     [Parameter(Mandatory=$true, ParameterSetName='Folder')]
     [string]$FolderPath,
+
+    [Parameter(Mandatory=$true, ParameterSetName='Adhoc')]
+    [string]$AdhocSQL,
 
     [Parameter(Mandatory=$false)]
     [string]$ServerName,
@@ -565,6 +577,14 @@ function Show-FilePicker {
         $fileDialog.Filter = "SQL Files (*.sql)|*.sql|All files (*.*)|*.*"
         $fileDialog.Multiselect = $true
         if ($fileDialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { 
+            # Save the directory of the selected file(s) for next time
+            try {
+                $directory = [System.IO.Path]::GetDirectoryName($fileDialog.FileNames[0])
+                Set-Content -Path $script:OptimusConfig.LastPathFile -Value $directory
+                Write-Log -Message "Saved last used directory: $directory" -Level 'DEBUG'
+            } catch {
+                Write-Log -Message "Could not save the last used directory path." -Level 'WARN'
+            }
             return $fileDialog.FileNames 
         }
     }
@@ -572,46 +592,78 @@ function Show-FilePicker {
     return $null
 }
 
-function Get-SQLQueryFile {
-    Write-Log -Message "Entering Function: Get-SQLQueryFile" -Level 'DEBUG'
+function Get-AnalysisInputs {
+    Write-Log -Message "Entering Function: Get-AnalysisInputs" -Level 'DEBUG'
     Write-Log -Message "Parameter Set Name: $($PSCmdlet.ParameterSetName)" -Level 'DEBUG'
     
-    [string[]]$filesToAnalyze = @()
+    $inputObjects = [System.Collections.Generic.List[object]]::new()
 
     switch ($PSCmdlet.ParameterSetName) {
+        'Adhoc' {
+            if (-not [string]::IsNullOrWhiteSpace($AdhocSQL)) {
+                $baseName = "AdhocQuery_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+                $inputObjects.Add([pscustomobject]@{
+                    SqlText  = $AdhocSQL
+                    BaseName = $baseName
+                })
+                Write-Log -Message "Received Ad-hoc SQL for analysis." -Level 'SUCCESS'
+            } else {
+                Write-Log -Message "The -AdhocSQL parameter was used but contained no query." -Level 'WARN'
+                return $null
+            }
+        }
         'Folder' {
             if (-not (Test-Path -Path $FolderPath -PathType Container)) {
                 Write-Log -Message "The path provided for -FolderPath is not a valid directory: '$FolderPath'." -Level 'ERROR'
                 return $null
             }
-            # Non-recursive search as requested
             $filesToAnalyze = (Get-ChildItem -Path $FolderPath -Filter *.sql).FullName
             if ($filesToAnalyze.Count -eq 0) {
                 Write-Log -Message "No .sql files were found in the specified folder: '$FolderPath'." -Level 'WARN'
                 return $null
             }
             Write-Log -Message "Found $($filesToAnalyze.Count) file(s) in folder '$FolderPath' for analysis." -Level 'SUCCESS'
+            foreach ($file in $filesToAnalyze) {
+                $inputObjects.Add([pscustomobject]@{
+                    SqlText  = Get-Content -Path $file -Raw
+                    BaseName = [System.IO.Path]::GetFileNameWithoutExtension($file)
+                })
+            }
         }
         'Files' {
+            [string[]]$validFiles = @()
             foreach ($file in $SQLFile) {
                 if ((Test-Path -Path $file -PathType Leaf) -and $file -like '*.sql') {
-                    $filesToAnalyze += $file
+                    $validFiles += $file
                 } else {
                     Write-Log -Message "Parameter invalid, file not found or not a .sql file: '$file'. Skipping." -Level 'WARN'
                 }
             }
-            if ($filesToAnalyze.Count -eq 0) {
+            if ($validFiles.Count -eq 0) {
                  Write-Log -Message "No valid .sql files were provided via the -SQLFile parameter." -Level 'WARN'
                  return $null
             }
+            Write-Log -Message "Successfully targeted $($validFiles.Count) file(s) for analysis." -Level 'SUCCESS'
+            foreach ($file in $validFiles) {
+                $inputObjects.Add([pscustomobject]@{
+                    SqlText  = Get-Content -Path $file -Raw
+                    BaseName = [System.IO.Path]::GetFileNameWithoutExtension($file)
+                })
+            }
         }
         default { # Interactive Mode
-            while ($filesToAnalyze.Count -eq 0) {
+            while ($inputObjects.Count -eq 0) {
                 Write-Log -Message "`nPlease select one or more .sql files to analyze..." -Level 'INFO'
                 $selectedFiles = Show-FilePicker
                 
                 if ($null -ne $selectedFiles -and $selectedFiles.Count -gt 0) {
-                    $filesToAnalyze = $selectedFiles
+                     Write-Log -Message "Successfully selected $($selectedFiles.Count) file(s) for analysis." -Level 'SUCCESS'
+                     foreach ($file in $selectedFiles) {
+                        $inputObjects.Add([pscustomobject]@{
+                            SqlText  = Get-Content -Path $file -Raw
+                            BaseName = [System.IO.Path]::GetFileNameWithoutExtension($file)
+                        })
+                    }
                 } else {
                     Write-Log -Message "   File selection cancelled. Try again? (Y/N): " -Level 'PROMPT' -NoNewLine
                     $retry = Read-Host
@@ -623,20 +675,7 @@ function Get-SQLQueryFile {
         }
     }
 
-    if ($filesToAnalyze.Count -gt 0) {
-        try {
-            $directory = [System.IO.Path]::GetDirectoryName($filesToAnalyze[0])
-            Set-Content -Path $script:OptimusConfig.LastPathFile -Value $directory
-            Write-Log -Message "Saved last used directory: $directory" -Level 'DEBUG'
-        } catch {
-            Write-Log -Message "Could not save the last used directory path." -Level 'WARN'
-        }
-        if ($PSCmdlet.ParameterSetName -ne 'Folder') {
-             Write-Log -Message "Successfully selected $($filesToAnalyze.Count) file(s) for analysis." -Level 'SUCCESS'
-        }
-    }
-
-    return $filesToAnalyze
+    return $inputObjects
 }
 #endregion
 
@@ -967,7 +1006,7 @@ Timestamp: $(Get-Date)
 # --- Main Application Logic ---
 function Start-Optimus {
     # Define the current version of the script in one place.
-    $script:CurrentVersion = "2.2"
+    $script:CurrentVersion = "2.3"
 
     if ($DebugMode) { Write-Log -Message "Starting Optimus v$($script:CurrentVersion) in Debug Mode." -Level 'DEBUG'}
 
@@ -1046,9 +1085,10 @@ function Start-Optimus {
             break 
         }
         
-        [string[]]$sqlFilePaths = Get-SQLQueryFile
-        if ($null -eq $sqlFilePaths -or $sqlFilePaths.Count -eq 0) {
-            Write-Log -Message "No files were selected for analysis." -Level 'WARN'
+        # Get the inputs for analysis (from files, folder, or ad-hoc string)
+        [array]$analysisInputs = Get-AnalysisInputs
+        if ($null -eq $analysisInputs -or $analysisInputs.Count -eq 0) {
+            Write-Log -Message "No valid inputs were found for analysis." -Level 'WARN'
             continue
         }
 
@@ -1089,32 +1129,31 @@ function Start-Optimus {
         Write-Log -Message "`nCreated batch analysis folder: $batchFolderPath" -Level 'SUCCESS'
 
         # Loop through each selected file
-        foreach ($sqlFilePath in $sqlFilePaths) {
+        foreach ($input in $analysisInputs) {
             try {
-                $fileNameOnly = [System.IO.Path]::GetFileName($sqlFilePath)
-                Write-Log -Message "`n--- Starting Analysis for: $fileNameOnly ---" -Level 'SUCCESS'
+                $baseName = $input.BaseName
+                $sqlQueryText = $input.SqlText
+
+                Write-Log -Message "`n--- Starting Analysis for: $baseName ---" -Level 'SUCCESS'
 
                 # Create a sub-folder for this specific file's analysis
-                $baseName = [System.IO.Path]::GetFileNameWithoutExtension($sqlFilePath)
                 $script:AnalysisPath = Join-Path -Path $batchFolderPath -ChildPath $baseName
                 New-Item -Path $script:AnalysisPath -ItemType Directory -Force | Out-Null
 
                 # Set up the log file path for this specific analysis
                 $script:LogFilePath = Join-Path -Path $script:AnalysisPath -ChildPath "ExecutionLog.txt"
-                "# Optimus v$($script:CurrentVersion) Execution Log | File: $fileNameOnly | Started: $(Get-Date)" | Out-File -FilePath $script:LogFilePath -Encoding utf8
+                "# Optimus v$($script:CurrentVersion) Execution Log | File: $baseName | Started: $(Get-Date)" | Out-File -FilePath $script:LogFilePath -Encoding utf8
                 
                 Write-Log -Message "Created analysis directory: '$($script:AnalysisPath)'" -Level 'INFO'
                 $sqlVersion = Get-SqlServerVersion -ServerInstance $selectedServer
                 Write-Log -Message "Detected SQL Server Version: $sqlVersion" -Level 'DEBUG'
                 
-                $sqlQueryText = Get-Content -Path $sqlFilePath -Raw
-            
                 # 1. Get Master Plan. Use a default context but the plan will have fully-qualified names.
                 $initialDbContext = ([regex]::Match($sqlQueryText, '(?im)^\s*USE\s+\[?([\w\d_]+)\]?')).Groups[1].Value
                 if ([string]::IsNullOrWhiteSpace($initialDbContext)) { $initialDbContext = 'master' }
                 $masterPlanXml = Get-MasterExecutionPlan -ServerInstance $selectedServer -DatabaseContext $initialDbContext -FullQueryText $sqlQueryText -IsActualPlan:$useActualPlanSwitch
                 if (-not $masterPlanXml) { 
-                    Write-Log -Message "Could not generate a master plan for $fileNameOnly. Skipping to next file." -Level 'ERROR'
+                    Write-Log -Message "Could not generate a master plan for $baseName. Skipping to next file." -Level 'ERROR'
                     continue 
                 }
                 
@@ -1149,7 +1188,7 @@ function Start-Optimus {
                         }
                     }
                 } else {
-                    Write-Log -Message "No user database objects were found in the execution plan for $fileNameOnly. Halting analysis for this file." -Level 'WARN'
+                    Write-Log -Message "No user database objects were found in the execution plan for $baseName. Halting analysis for this file." -Level 'WARN'
                     continue
                 }
 
@@ -1170,13 +1209,13 @@ function Start-Optimus {
                     $tunedScriptPath = Join-Path -Path $script:AnalysisPath -ChildPath "${baseName}_tuned.sql"
                     $finalScript | Out-File -FilePath $tunedScriptPath -Encoding UTF8
                     New-AnalysisSummary -TunedScript $finalScript -TotalStatementCount $statementNodes.Count -AnalysisPath $script:AnalysisPath
-                    Write-Log -Message "Analysis complete for $fileNameOnly." -Level 'SUCCESS'
+                    Write-Log -Message "Analysis complete for $baseName." -Level 'SUCCESS'
                 } else {
-                    Write-Log -Message "Analysis halted for $fileNameOnly due to an error or empty response from the AI." -Level 'ERROR'
+                    Write-Log -Message "Analysis halted for $baseName due to an error or empty response from the AI." -Level 'ERROR'
                 }
             }
             catch {
-                Write-Log -Message "CRITICAL UNHANDLED ERROR during analysis of '$fileNameOnly': $($_.Exception.Message). Moving to next file." -Level 'ERROR'
+                Write-Log -Message "CRITICAL UNHANDLED ERROR during analysis of '$($input.BaseName)': $($_.Exception.Message). Moving to next item." -Level 'ERROR'
                 Write-Log -Message "Stack Trace: $($_.ScriptStackTrace)" -Level 'DEBUG'
             }
         } # End foreach loop
