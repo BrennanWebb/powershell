@@ -49,10 +49,11 @@
 .NOTES
     Designer: Brennan Webb
     Script Engine: Gemini
-    Version: 2.3
+    Version: 2.4
     Created: 2025-06-21
     Modified: 2025-06-23
     Change Log:
+    - v2.4: Minor wording change for AI analysis message.
     - v2.3: Added -AdhocSQL parameter and 'Adhoc' parameter set to allow for direct T-SQL string analysis. Refactored input handling.
     - v2.2: Added -ServerName parameter to allow for non-interactive server selection, enabling full automation.
     - v2.1: Modified plan selection to be non-interactive for automated runs. It now defaults to 'Estimated' plan unless -UseActualPlan is specified.
@@ -852,7 +853,7 @@ function Invoke-GeminiAnalysis {
         [string]$SqlServerVersion
     )
     Write-Log -Message "Entering Function: Invoke-GeminiAnalysis" -Level 'DEBUG'
-    Write-Log -Message "Sending full script to Gemini for holistic analysis..." -Level 'INFO'
+    Write-Log -Message "Sending full script to Gemini for analysis..." -Level 'INFO'
 
     $plainTextApiKey = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto([System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($ApiKey))
     $uri = "https://generativelanguage.googleapis.com/v1beta/models/$($ModelName):generateContent?key=$plainTextApiKey"
@@ -1006,7 +1007,7 @@ Timestamp: $(Get-Date)
 # --- Main Application Logic ---
 function Start-Optimus {
     # Define the current version of the script in one place.
-    $script:CurrentVersion = "2.3"
+    $script:CurrentVersion = "2.4"
 
     if ($DebugMode) { Write-Log -Message "Starting Optimus v$($script:CurrentVersion) in Debug Mode." -Level 'DEBUG'}
 
@@ -1096,8 +1097,7 @@ function Start-Optimus {
         $useActualPlanSwitch = $UseActualPlan.IsPresent
 
         # In interactive mode, if the plan type isn't specified, we must ask the user.
-        # In non-interactive modes ('Files' or 'Folder'), it defaults to Estimated unless -UseActualPlan is specified,
-        # preventing the script from halting during automated runs.
+        # In non-interactive modes ('Files', 'Folder', 'Adhoc'), it defaults to Estimated unless -UseActualPlan is specified.
         if ($PSCmdlet.ParameterSetName -eq 'Interactive' -and -not $UseActualPlan.IsPresent) {
             Write-Log -Message "`nWhich execution plan would you like to generate for this batch?" -Level 'INFO'
             Write-Log -Message "   [1] Estimated (Default - Recommended, does not run the query)" -Level 'PROMPT'
@@ -1128,7 +1128,7 @@ function Start-Optimus {
         New-Item -Path $batchFolderPath -ItemType Directory -Force | Out-Null
         Write-Log -Message "`nCreated batch analysis folder: $batchFolderPath" -Level 'SUCCESS'
 
-        # Loop through each selected file
+        # Loop through each input object
         foreach ($input in $analysisInputs) {
             try {
                 $baseName = $input.BaseName
@@ -1153,7 +1153,7 @@ function Start-Optimus {
                 if ([string]::IsNullOrWhiteSpace($initialDbContext)) { $initialDbContext = 'master' }
                 $masterPlanXml = Get-MasterExecutionPlan -ServerInstance $selectedServer -DatabaseContext $initialDbContext -FullQueryText $sqlQueryText -IsActualPlan:$useActualPlanSwitch
                 if (-not $masterPlanXml) { 
-                    Write-Log -Message "Could not generate a master plan for $baseName. Skipping to next file." -Level 'ERROR'
+                    Write-Log -Message "Could not generate a master plan for $baseName. Skipping to next item." -Level 'ERROR'
                     continue 
                 }
                 
@@ -1188,12 +1188,12 @@ function Start-Optimus {
                         }
                     }
                 } else {
-                    Write-Log -Message "No user database objects were found in the execution plan for $baseName. Halting analysis for this file." -Level 'WARN'
+                    Write-Log -Message "No user database objects were found in the execution plan for $baseName. Halting analysis for this item." -Level 'WARN'
                     continue
                 }
 
                 if ([string]::IsNullOrWhiteSpace($consolidatedSchema)) {
-                     Write-Log -Message "Schema collection resulted in an empty document. This could be due to permissions or missing objects. Halting analysis for this file." -Level 'WARN'
+                     Write-Log -Message "Schema collection resulted in an empty document. This could be due to permissions or missing objects. Halting analysis for this item." -Level 'WARN'
                      continue
                 }
 
