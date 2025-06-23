@@ -16,6 +16,9 @@
     The path to a single folder. The script will analyze all .sql files found in this folder (non-recursively). 
     This parameter cannot be used with -SQLFile.
 
+.PARAMETER ServerName
+    An optional parameter to specify the SQL Server instance for the analysis, bypassing the interactive menu.
+
 .PARAMETER UseActualPlan
     An optional switch to generate the 'Actual' execution plan. This WILL execute the query.
     If not present, the script defaults to 'Estimated' or will prompt in interactive mode.
@@ -29,23 +32,20 @@
 
 .EXAMPLE
     .\Optimus.ps1
-    Runs the script in interactive mode, using a graphical file picker to select files.
+    Runs the script in interactive mode, using a graphical file picker and server selection menu.
 
 .EXAMPLE
-    .\Optimus.ps1 -SQLFile "C:\Scripts\Proc1.sql", "C:\Scripts\Proc2.sql"
-    Runs a batch analysis on the two specified files, using the default 'Estimated' execution plan.
-
-.EXAMPLE
-    .\Optimus.ps1 -FolderPath "C:\My TSQL Projects\Batch1" -UseActualPlan
-    Runs a batch analysis on all .sql files in the folder, using an 'Actual' execution plan.
+    .\Optimus.ps1 -FolderPath "C:\My TSQL Projects\Batch1" -ServerName "PROD-DB01\SQL2022"
+    Runs a fully automated analysis on all .sql files in the folder against the specified server, using the default 'Estimated' plan.
 
 .NOTES
     Designer: Brennan Webb
     Script Engine: Gemini
-    Version: 2.1
+    Version: 2.2
     Created: 2025-06-21
     Modified: 2025-06-23
     Change Log:
+    - v2.2: Added -ServerName parameter to allow for non-interactive server selection, enabling full automation.
     - v2.1: Modified plan selection to be non-interactive for automated runs. It now defaults to 'Estimated' plan unless -UseActualPlan is specified.
     - v2.0: Updated output directory to be segmented by model name.
     - v2.0: Promoted to major version after preview cycle.
@@ -70,6 +70,9 @@ param (
 
     [Parameter(Mandatory=$true, ParameterSetName='Folder')]
     [string]$FolderPath,
+
+    [Parameter(Mandatory=$false)]
+    [string]$ServerName,
 
     [Parameter(Mandatory=$false)]
     [switch]$UseActualPlan,
@@ -964,7 +967,7 @@ Timestamp: $(Get-Date)
 # --- Main Application Logic ---
 function Start-Optimus {
     # Define the current version of the script in one place.
-    $script:CurrentVersion = "2.1"
+    $script:CurrentVersion = "2.2"
 
     if ($DebugMode) { Write-Log -Message "Starting Optimus v$($script:CurrentVersion) in Debug Mode." -Level 'DEBUG'}
 
@@ -1009,7 +1012,39 @@ function Start-Optimus {
         $script:AnalysisPath = $null 
         $script:LogFilePath = $null
 
-        $selectedServer = Select-SqlServer; if (-not $selectedServer) { Write-Log -Message "No server selected." -Level 'WARN'; break }
+        # Server Selection Logic
+        $selectedServer = $null
+        # If the ServerName parameter is provided, use it.
+        if (-not [string]::IsNullOrWhiteSpace($ServerName)) {
+            Write-Log -Message "ServerName parameter provided, attempting to connect to '$ServerName'." -Level 'INFO'
+            if (Test-SqlServerConnection -ServerInstance $ServerName) {
+                $selectedServer = $ServerName
+                # Logic to save the validated server to the config file for future use
+                try {
+                    [array]$servers = Get-Content -Path $script:OptimusConfig.ServerFile | ConvertFrom-Json
+                    if ($selectedServer -notin $servers) {
+                        $servers += $selectedServer
+                        ($servers | Sort-Object -Unique) | ConvertTo-Json -Depth 5 | Set-Content -Path $script:OptimusConfig.ServerFile
+                        Write-Log -Message "'$selectedServer' has been validated and saved to the configuration." -Level 'DEBUG'
+                    }
+                } catch {
+                    Write-Log -Message "Could not save the provided server name to the configuration file." -Level 'WARN'
+                }
+            } else {
+                # If the connection fails, stop the script.
+                Write-Log -Message "Connection test to the server '$ServerName' failed. Please check the server name and permissions." -Level 'ERROR'
+                return # Exit the function/script
+            }
+        } else {
+            # Otherwise, fall back to the interactive menu.
+            $selectedServer = Select-SqlServer
+        }
+
+        # Final check to ensure a server was successfully selected.
+        if (-not $selectedServer) {
+            Write-Log -Message "No valid SQL Server was selected or provided. Halting analysis for this batch." -Level 'WARN'
+            break 
+        }
         
         [string[]]$sqlFilePaths = Get-SQLQueryFile
         if ($null -eq $sqlFilePaths -or $sqlFilePaths.Count -eq 0) {
