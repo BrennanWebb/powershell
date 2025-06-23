@@ -27,6 +27,9 @@
     An optional switch to generate the 'Actual' execution plan. This WILL execute the query.
     If not present, the script defaults to 'Estimated' or will prompt in interactive mode.
 
+.PARAMETER OpenTunedFile
+    An optional switch that opens the final tuned .sql file using the default OS application (e.g., SSMS) after analysis is complete.
+
 .PARAMETER ResetConfiguration
     An optional switch to trigger an interactive menu that allows for resetting user configurations.
     This can be used to clear the saved API key, server list, and optionally, all past analysis reports.
@@ -43,34 +46,24 @@
     Runs a fully automated analysis on all .sql files in the folder against the specified server.
 
 .EXAMPLE
-    .\Optimus.ps1 -AdhocSQL "SELECT * FROM Sales.SalesOrderHeader WHERE OrderDate > '2011-01-01'" -ServerName "PROD-DB01\SQL2022"
-    Runs a fully automated analysis on the provided T-SQL string.
+    .\Optimus.ps1 -AdhocSQL "SELECT * FROM Sales.SalesOrderHeader WHERE OrderDate > '2011-01-01'" -ServerName "PROD-DB01\SQL2022" -OpenTunedFile
+    Runs a fully automated analysis on the provided T-SQL string and opens the resulting tuned file.
 
 .NOTES
     Designer: Brennan Webb
     Script Engine: Gemini
-    Version: 2.4
+    Version: 2.6
     Created: 2025-06-21
     Modified: 2025-06-23
     Change Log:
+    - v2.6: Suppressed opening the main analysis folder when -OpenTunedFile is used, unless in -DebugMode.
+    - v2.5: Added -OpenTunedFile switch to automatically open the final output file.
     - v2.4: Minor wording change for AI analysis message.
     - v2.3: Added -AdhocSQL parameter and 'Adhoc' parameter set to allow for direct T-SQL string analysis. Refactored input handling.
     - v2.2: Added -ServerName parameter to allow for non-interactive server selection, enabling full automation.
     - v2.1: Modified plan selection to be non-interactive for automated runs. It now defaults to 'Estimated' plan unless -UseActualPlan is specified.
     - v2.0: Updated output directory to be segmented by model name.
     - v2.0: Promoted to major version after preview cycle.
-    - v1.9-preview: Updated AI prompt to explicitly forbid Markdown within recommendation comments.
-    - v1.8-preview: Implemented a one-time, persistent model selection configuration.
-    - v1.8-preview: Updated reset logic to include clearing the selected model.
-    - v1.7-preview: Corrected and hardened the AI prompt to ensure the full original script is always returned.
-    - v1.6-preview: Added logic to skip schema collection for the mssqlsystemresource database.
-    - v1.5-preview: Modified plan collection to capture all statements in a script.
-    - v1.5-preview: Hardened schema collection to support system tables.
-    - v1.4-preview: Removed the logic that excludes 'sys' schema objects from analysis.
-    - v1.3-preview: Added an option to Reset-OptimusConfiguration to remove only analysis reports.
-    - v1.2-preview: Renamed function to use an approved PowerShell verb (Invoke-OptimusVersionCheck).
-    - v1.1-preview: Added an automatic version check at startup.
-    - v1.0-preview: Initial preview release. Re-versioned from legacy builds.
     Powershell Version: 5.1+
 #>
 [CmdletBinding(DefaultParameterSetName = 'Interactive')]
@@ -89,6 +82,9 @@ param (
 
     [Parameter(Mandatory=$false)]
     [switch]$UseActualPlan,
+
+    [Parameter(Mandatory=$false)]
+    [switch]$OpenTunedFile,
     
     [Parameter(Mandatory=$false)]
     [switch]$ResetConfiguration,
@@ -1007,7 +1003,7 @@ Timestamp: $(Get-Date)
 # --- Main Application Logic ---
 function Start-Optimus {
     # Define the current version of the script in one place.
-    $script:CurrentVersion = "2.4"
+    $script:CurrentVersion = "2.6"
 
     if ($DebugMode) { Write-Log -Message "Starting Optimus v$($script:CurrentVersion) in Debug Mode." -Level 'DEBUG'}
 
@@ -1208,6 +1204,18 @@ function Start-Optimus {
                     $finalScript = $finalScript.Trim()
                     $tunedScriptPath = Join-Path -Path $script:AnalysisPath -ChildPath "${baseName}_tuned.sql"
                     $finalScript | Out-File -FilePath $tunedScriptPath -Encoding UTF8
+                    
+                    # If requested, open the tuned file with the default application
+                    if ($OpenTunedFile.IsPresent) {
+                        Write-Log -Message "Opening tuned file: $tunedScriptPath" -Level 'INFO'
+                        try {
+                            Invoke-Item -Path $tunedScriptPath
+                        }
+                        catch {
+                            Write-Log -Message "Failed to open the tuned file automatically: $($_.Exception.Message)" -Level 'WARN'
+                        }
+                    }
+
                     New-AnalysisSummary -TunedScript $finalScript -TotalStatementCount $statementNodes.Count -AnalysisPath $script:AnalysisPath
                     Write-Log -Message "Analysis complete for $baseName." -Level 'SUCCESS'
                 } else {
@@ -1224,11 +1232,14 @@ function Start-Optimus {
         Write-Log -Message "All analysis folders for this batch are located in:" -Level 'SUCCESS'
         Write-Log -Message "$batchFolderPath" -Level 'RESULT'
 
-        try {
-            Invoke-Item -Path $batchFolderPath
-            Write-Log -Message "Opening batch folder in File Explorer." -Level 'DEBUG'
-        } catch {
-            Write-Log -Message "Could not automatically open the batch folder. Please navigate to the path above manually." -Level 'WARN'
+        # Conditionally open the batch folder. It will be skipped if -OpenTunedFile is used without -DebugMode.
+        if (-not $OpenTunedFile.IsPresent -or $DebugMode.IsPresent) {
+            try {
+                Invoke-Item -Path $batchFolderPath
+                Write-Log -Message "Opening batch folder in File Explorer." -Level 'DEBUG'
+            } catch {
+                Write-log -Message "Could not automatically open the batch folder. Please navigate to the path above manually." -Level 'WARN'
+            }
         }
         
         Write-Log -Message "`nWould you like to analyze another batch of files? (Y/N): " -Level 'PROMPT' -NoNewLine
