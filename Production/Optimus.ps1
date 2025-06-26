@@ -9,13 +9,16 @@
     messages, and recommendations are recorded in a detailed log file for each analysis.
 
 .PARAMETER SQLFile
-    The path to one or more .sql files to be analyzed. For multiple files, provide a comma-separated list. This parameter is processed if -AdhocSQL is not provided or is empty.
+    The path to one or more .sql files to be analyzed. For multiple files, provide a comma-separated list. This parameter
+    cannot be used with -FolderPath or -AdhocSQL.
 
 .PARAMETER FolderPath
-    The path to a single folder. The script will analyze all .sql files found in this folder (non-recursively). This parameter is processed if -AdhocSQL and -SQLFile are not provided.
+    The path to a single folder. The script will analyze all .sql files found in this folder (non-recursively). 
+    This parameter cannot be used with -SQLFile or -AdhocSQL.
 
 .PARAMETER AdhocSQL
-    A string containing the T-SQL query to be analyzed. This parameter takes precedence over all other input types (-SQLFile, -FolderPath). If this parameter is provided with a populated string, the others will be ignored.
+    A string containing the T-SQL query to be analyzed. This is useful for passing queries directly from other applications.
+    This parameter cannot be used with -SQLFile or -FolderPath.
 
 .PARAMETER ServerName
     An optional parameter to specify the SQL Server instance for the analysis, bypassing the interactive menu.
@@ -35,26 +38,24 @@
     Enables detailed diagnostic output to the console. All messages are always written to the execution log file regardless of this setting.
 
 .EXAMPLE
-    .\Optimus.ps1 -DebugMode
-    Runs the script in interactive mode and logs all bound parameters and detailed diagnostic messages to the console and execution log file(s).
+    .\Optimus.ps1
+    Runs the script in interactive mode, using a graphical file picker and server selection menu.
 
 .EXAMPLE
     .\Optimus.ps1 -FolderPath "C:\My TSQL Projects\Batch1" -ServerName "PROD-DB01\SQL2022"
     Runs a fully automated analysis on all .sql files in the folder against the specified server.
 
 .EXAMPLE
-    .\Optimus.ps1 -AdhocSQL "SELECT * FROM Sales.SalesOrderHeader WHERE OrderDate > '2011-01-01'" -SQLFile "C:\some\other.sql"
-    Runs analysis ONLY on the -AdhocSQL string due to precedence rules, ignoring the -SQLFile parameter.
+    .\Optimus.ps1 -AdhocSQL "SELECT * FROM Sales.SalesOrderHeader WHERE OrderDate > '2011-01-01'" -ServerName "PROD-DB01\SQL2022" -OpenTunedFile
+    Runs a fully automated analysis on the provided T-SQL string and opens the resulting tuned file.
 
 .NOTES
     Designer: Brennan Webb
     Script Engine: Gemini
-    Version: 2.8
+    Version: 2.6
     Created: 2025-06-21
-    Modified: 2025-06-26
+    Modified: 2025-06-23
     Change Log:
-    - v2.8: Added parameter logging in -DebugMode to both console and the execution log file.
-    - v2.7: Reworked parameter handling to remove strict parameter sets. Added input precedence logic (Adhoc > File > Folder > Interactive) and ignore empty -AdhocSQL value.
     - v2.6: Suppressed opening the main analysis folder when -OpenTunedFile is used, unless in -DebugMode.
     - v2.5: Added -OpenTunedFile switch to automatically open the final output file.
     - v2.4: Minor wording change for AI analysis message.
@@ -65,15 +66,15 @@
     - v2.0: Promoted to major version after preview cycle.
     Powershell Version: 5.1+
 #>
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = 'Interactive')]
 param (
-    [Parameter(Mandatory=$false)]
+    [Parameter(Mandatory=$true, ParameterSetName='Files')]
     [string[]]$SQLFile,
 
-    [Parameter(Mandatory=$false)]
+    [Parameter(Mandatory=$true, ParameterSetName='Folder')]
     [string]$FolderPath,
 
-    [Parameter(Mandatory=$false)]
+    [Parameter(Mandatory=$true, ParameterSetName='Adhoc')]
     [string]$AdhocSQL,
 
     [Parameter(Mandatory=$false)]
@@ -590,79 +591,83 @@ function Show-FilePicker {
 
 function Get-AnalysisInputs {
     Write-Log -Message "Entering Function: Get-AnalysisInputs" -Level 'DEBUG'
+    Write-Log -Message "Parameter Set Name: $($PSCmdlet.ParameterSetName)" -Level 'DEBUG'
+    
     $inputObjects = [System.Collections.Generic.List[object]]::new()
 
-    # Precedence-based input handling: Adhoc > SQLFile > FolderPath > Interactive
-    if (-not [string]::IsNullOrWhiteSpace($AdhocSQL)) {
-        Write-Log -Message "Processing input using -AdhocSQL parameter precedence." -Level 'DEBUG'
-        $baseName = "AdhocQuery_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
-        $inputObjects.Add([pscustomobject]@{
-            SqlText  = $AdhocSQL
-            BaseName = $baseName
-        })
-        Write-Log -Message "Received Ad-hoc SQL for analysis." -Level 'SUCCESS'
-    }
-    elseif ($SQLFile) {
-        Write-Log -Message "Processing input using -SQLFile parameter precedence." -Level 'DEBUG'
-        [string[]]$validFiles = @()
-        foreach ($file in $SQLFile) {
-            if ((Test-Path -Path $file -PathType Leaf) -and $file -like '*.sql') {
-                $validFiles += $file
+    switch ($PSCmdlet.ParameterSetName) {
+        'Adhoc' {
+            if (-not [string]::IsNullOrWhiteSpace($AdhocSQL)) {
+                $baseName = "AdhocQuery_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+                $inputObjects.Add([pscustomobject]@{
+                    SqlText  = $AdhocSQL
+                    BaseName = $baseName
+                })
+                Write-Log -Message "Received Ad-hoc SQL for analysis." -Level 'SUCCESS'
             } else {
-                Write-Log -Message "Parameter invalid, file not found or not a .sql file: '$file'. Skipping." -Level 'WARN'
+                Write-Log -Message "The -AdhocSQL parameter was used but contained no query." -Level 'WARN'
+                return $null
             }
         }
-        if ($validFiles.Count -eq 0) {
-             Write-Log -Message "No valid .sql files were provided via the -SQLFile parameter." -Level 'WARN'
-             return $null
+        'Folder' {
+            if (-not (Test-Path -Path $FolderPath -PathType Container)) {
+                Write-Log -Message "The path provided for -FolderPath is not a valid directory: '$FolderPath'." -Level 'ERROR'
+                return $null
+            }
+            $filesToAnalyze = (Get-ChildItem -Path $FolderPath -Filter *.sql).FullName
+            if ($filesToAnalyze.Count -eq 0) {
+                Write-Log -Message "No .sql files were found in the specified folder: '$FolderPath'." -Level 'WARN'
+                return $null
+            }
+            Write-Log -Message "Found $($filesToAnalyze.Count) file(s) in folder '$FolderPath' for analysis." -Level 'SUCCESS'
+            foreach ($file in $filesToAnalyze) {
+                $inputObjects.Add([pscustomobject]@{
+                    SqlText  = Get-Content -Path $file -Raw
+                    BaseName = [System.IO.Path]::GetFileNameWithoutExtension($file)
+                })
+            }
         }
-        Write-Log -Message "Successfully targeted $($validFiles.Count) file(s) for analysis." -Level 'SUCCESS'
-        foreach ($file in $validFiles) {
-            $inputObjects.Add([pscustomobject]@{
-                SqlText  = Get-Content -Path $file -Raw
-                BaseName = [System.IO.Path]::GetFileNameWithoutExtension($file)
-            })
-        }
-    }
-    elseif ($FolderPath) {
-        Write-Log -Message "Processing input using -FolderPath parameter precedence." -Level 'DEBUG'
-        if (-not (Test-Path -Path $FolderPath -PathType Container)) {
-            Write-Log -Message "The path provided for -FolderPath is not a valid directory: '$FolderPath'." -Level 'ERROR'
-            return $null
-        }
-        $filesToAnalyze = (Get-ChildItem -Path $FolderPath -Filter *.sql).FullName
-        if ($filesToAnalyze.Count -eq 0) {
-            Write-Log -Message "No .sql files were found in the specified folder: '$FolderPath'." -Level 'WARN'
-            return $null
-        }
-        Write-Log -Message "Found $($filesToAnalyze.Count) file(s) in folder '$FolderPath' for analysis." -Level 'SUCCESS'
-        foreach ($file in $filesToAnalyze) {
-            $inputObjects.Add([pscustomobject]@{
-                SqlText  = Get-Content -Path $file -Raw
-                BaseName = [System.IO.Path]::GetFileNameWithoutExtension($file)
-            })
-        }
-    }
-    else { # Interactive Mode
-        Write-Log -Message "No input parameters provided, entering interactive mode." -Level 'DEBUG'
-        while ($inputObjects.Count -eq 0) {
-            Write-Log -Message "`nPlease select one or more .sql files to analyze..." -Level 'INFO'
-            $selectedFiles = Show-FilePicker
-            
-            if ($null -ne $selectedFiles -and $selectedFiles.Count -gt 0) {
-                 Write-Log -Message "Successfully selected $($selectedFiles.Count) file(s) for analysis." -Level 'SUCCESS'
-                 foreach ($file in $selectedFiles) {
-                    $inputObjects.Add([pscustomobject]@{
-                        SqlText  = Get-Content -Path $file -Raw
-                        BaseName = [System.IO.Path]::GetFileNameWithoutExtension($file)
-                    })
+        'Files' {
+            [string[]]$validFiles = @()
+            foreach ($file in $SQLFile) {
+                if ((Test-Path -Path $file -PathType Leaf) -and $file -like '*.sql') {
+                    $validFiles += $file
+                } else {
+                    Write-Log -Message "Parameter invalid, file not found or not a .sql file: '$file'. Skipping." -Level 'WARN'
                 }
-            } else {
-                Write-Log -Message "   File selection cancelled. Try again? (Y/N): " -Level 'PROMPT' -NoNewLine
-                $retry = Read-Host
-                Write-Host ""
-                Write-Log -Message "User Input: $retry" -Level 'DEBUG'
-                if ($retry -notmatch '^[Yy]$') { return $null }
+            }
+            if ($validFiles.Count -eq 0) {
+                 Write-Log -Message "No valid .sql files were provided via the -SQLFile parameter." -Level 'WARN'
+                 return $null
+            }
+            Write-Log -Message "Successfully targeted $($validFiles.Count) file(s) for analysis." -Level 'SUCCESS'
+            foreach ($file in $validFiles) {
+                $inputObjects.Add([pscustomobject]@{
+                    SqlText  = Get-Content -Path $file -Raw
+                    BaseName = [System.IO.Path]::GetFileNameWithoutExtension($file)
+                })
+            }
+        }
+        default { # Interactive Mode
+            while ($inputObjects.Count -eq 0) {
+                Write-Log -Message "`nPlease select one or more .sql files to analyze..." -Level 'INFO'
+                $selectedFiles = Show-FilePicker
+                
+                if ($null -ne $selectedFiles -and $selectedFiles.Count -gt 0) {
+                     Write-Log -Message "Successfully selected $($selectedFiles.Count) file(s) for analysis." -Level 'SUCCESS'
+                     foreach ($file in $selectedFiles) {
+                        $inputObjects.Add([pscustomobject]@{
+                            SqlText  = Get-Content -Path $file -Raw
+                            BaseName = [System.IO.Path]::GetFileNameWithoutExtension($file)
+                        })
+                    }
+                } else {
+                    Write-Log -Message "   File selection cancelled. Try again? (Y/N): " -Level 'PROMPT' -NoNewLine
+                    $retry = Read-Host
+                    Write-Host ""
+                    Write-Log -Message "User Input: $retry" -Level 'DEBUG'
+                    if ($retry -notmatch '^[Yy]$') { return $null }
+                }
             }
         }
     }
@@ -851,28 +856,26 @@ function Invoke-GeminiAnalysis {
 
     # --- Start of Modified Prompt ---
     $prompt = @"
-You are an expert T-SQL performance tuning assistant, utilizing industry standard best practices for tuning. You have been provided with the specific SQL Server version, original T-SQL script, schema metadata for objects (column data types, indexes, constraints, etc), and most importantly, an xml execution plan.
+You are an expert T-SQL performance tuning assistant. You will be provided with the specific SQL Server version. You MUST ensure that any T-SQL syntax you generate is valid for that version.
+
+Your Core Mandate:
+Your ONLY task is to return the complete, original T-SQL script provided below. You will add T-SQL comment blocks containing your analysis directly above any statements you identify for improvement. Think of this as a text transformation task: the original text is your input, and the identical text with your added comments is the only output.
 
 Your Golden Rule:
-Your PRIMARY RULE is to return the complete, original --- FULL T-SQL SCRIPT --- provided below. You will add T-SQL comment blocks containing your analysis directly above any statement you identify as needing improvement. Think of this as a text transformation task: the original text is your input, and the identical text with your added comments is the only output.  Your Golden Rule is to NEVER change, alter, or remove any of the original, executable T-SQL statements.
+You MUST NOT change the original T-SQL code. The final output must contain the original, unmodified T-SQL script with only your comments added.
 
 Your Task:
-Your primary goal is to identify the most impactful performance improvements based on the evidence found in the --- MASTER EXECUTION PLAN --- and the --- CONSOLIDATED OBJECT SCHEMAS AND DEFINITIONS --- sections below. For any statement that can be improved, you will add a single T-SQL block comment immediately above it. Within this block comment, you may provide one or more recommendations. If a statement is already optimal, do not add a comment for it.
+Your primary goal is to identify ALL potential performance improvements for each T-SQL statement. For any statement that can be improved, you will add a single T-SQL block comment immediately above it. Within this block comment, you may provide one or more recommendations. If a statement is already optimal, do not add a comment for it.
 
-Comment Structure:
-As for comment structure, you should consider the following categories for your recommendations. For any given T-SQL statement, multiple recommendations from different categories might be valid. For example, a statement could be improved with both a query rewrite AND a new index. Present all valid options.
-1.  **Non-Invasive Query Rewrites:** These are the most desirable. 
-    * **Look for opportunities to make predicates SARGable**
-    * **Simplify logic**
-    * **Use more efficient patterns that are valid for the specified SQL Server version.**
-    * **Look for parameter sniffing opportunities for procedures**
-
+Recommendation Categories:
+You should consider the following categories of recommendations. For any given T-SQL statement, multiple recommendations from different categories might be valid. For example, a statement could be improved with both a query rewrite AND a new index. Present all valid options.
+1.  **Non-Invasive Query Rewrites:** These are the most desirable. Look for opportunities to make predicates SARGable, simplify logic, or use more efficient patterns that are valid for the specified SQL Server version.
 2.  **Indexing Improvements:**
     * **Alter Existing Index:** If an existing index can be modified (e.g., adding an INCLUDE column) to better serve the query, provide the necessary `DROP` and `CREATE` DDL.
     * **Create New Index:** If no existing index is a suitable candidate for alteration, recommend a new, covering index. Provide the complete `CREATE INDEX` DDL.
 
 Comment Formatting:
-Every analysis comment block you add MUST use the following structure. The block starts with a general "Optimus Analysis" header. Inside, each distinct recommendation is numbered and contains the three required sections. This allows for multiple, independent suggestions for the same statement. Important: All text inside the comment block must be plain text. Do **NOT** use any Markdown formatting like **bolding** or `backticks` or ```sql or ```.
+Every analysis comment block you add MUST use the following structure. The block starts with a general "Optimus Analysis" header. Inside, each distinct recommendation is numbered and contains the three required sections. This allows for multiple, independent suggestions for the same statement. Important: All text inside the comment block must be plain text. Do not use any Markdown formatting like **bolding** or `backticks`.
 
 /*
 --- Optimus Analysis ---
@@ -1000,35 +1003,9 @@ Timestamp: $(Get-Date)
 # --- Main Application Logic ---
 function Start-Optimus {
     # Define the current version of the script in one place.
-    $script:CurrentVersion = "2.8"
+    $script:CurrentVersion = "2.6"
 
-    if ($DebugMode) { Write-Log -Message "Starting Optimus v$($script:CurrentVersion) in Debug Mode." -Level 'DEBUG' }
-
-    # Capture bound parameters into a string for logging if DebugMode is enabled.
-    $parameterLogString = ""
-    if ($DebugMode) {
-        $logEntries = @("--- Script Parameters For This Batch ---")
-        if ($PSBoundParameters.Count -gt 0) {
-            $PSBoundParameters.GetEnumerator() | ForEach-Object {
-                $paramName = $_.Key
-                $paramValue = $_.Value
-
-                # Handle switch parameters for clean logging
-                if ($paramValue -is [System.Management.Automation.SwitchParameter]) {
-                    $paramValue = $paramValue.IsPresent
-                }
-                # Handle array parameters for clean logging
-                elseif ($paramValue -is [array]) {
-                    $paramValue = "'$($paramValue -join "', '")'"
-                }
-                
-                $logEntries += "  -> '$($paramName)' = '$($paramValue)'"
-            }
-        } else {
-            $logEntries += "  No parameters were bound for this run."
-        }
-        $parameterLogString = $logEntries -join "`r`n"
-    }
+    if ($DebugMode) { Write-Log -Message "Starting Optimus v$($script:CurrentVersion) in Debug Mode." -Level 'DEBUG'}
 
     # Group prerequisite checks
     $checksPassed = {
@@ -1115,12 +1092,9 @@ function Start-Optimus {
         # Select Plan Type once for the entire batch.
         $useActualPlanSwitch = $UseActualPlan.IsPresent
 
-        # Determine if we are running in interactive mode by checking if any input parameters were supplied.
-        $isInteractive = -not ($PSBoundParameters.ContainsKey('AdhocSQL') -or $PSBoundParameters.ContainsKey('SQLFile') -or $PSBoundParameters.ContainsKey('FolderPath'))
-        Write-Log -Message "Interactive mode evaluated as: $isInteractive" -Level 'DEBUG'
-
-        # In interactive mode, if the plan type isn't specified via switch, we must ask the user.
-        if ($isInteractive -and -not $UseActualPlan.IsPresent) {
+        # In interactive mode, if the plan type isn't specified, we must ask the user.
+        # In non-interactive modes ('Files', 'Folder', 'Adhoc'), it defaults to Estimated unless -UseActualPlan is specified.
+        if ($PSCmdlet.ParameterSetName -eq 'Interactive' -and -not $UseActualPlan.IsPresent) {
             Write-Log -Message "`nWhich execution plan would you like to generate for this batch?" -Level 'INFO'
             Write-Log -Message "   [1] Estimated (Default - Recommended, does not run the query)" -Level 'PROMPT'
             Write-Log -Message "   [2] Actual (Executes the query, use with caution on all files)" -Level 'PROMPT'
@@ -1166,11 +1140,6 @@ function Start-Optimus {
                 $script:LogFilePath = Join-Path -Path $script:AnalysisPath -ChildPath "ExecutionLog.txt"
                 "# Optimus v$($script:CurrentVersion) Execution Log | File: $baseName | Started: $(Get-Date)" | Out-File -FilePath $script:LogFilePath -Encoding utf8
                 
-                # Log the captured parameters if DebugMode is on
-                if (-not [string]::IsNullOrEmpty($parameterLogString)) {
-                    Write-Log -Message $parameterLogString -Level 'DEBUG'
-                }
-
                 Write-Log -Message "Created analysis directory: '$($script:AnalysisPath)'" -Level 'INFO'
                 $sqlVersion = Get-SqlServerVersion -ServerInstance $selectedServer
                 Write-Log -Message "Detected SQL Server Version: $sqlVersion" -Level 'DEBUG'
