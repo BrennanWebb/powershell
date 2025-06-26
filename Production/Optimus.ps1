@@ -36,7 +36,7 @@
 
 .EXAMPLE
     .\Optimus.ps1 -DebugMode
-    Runs the script in interactive mode and logs all bound parameters and detailed diagnostic messages to the console.
+    Runs the script in interactive mode and logs all bound parameters and detailed diagnostic messages to the console and execution log file(s).
 
 .EXAMPLE
     .\Optimus.ps1 -FolderPath "C:\My TSQL Projects\Batch1" -ServerName "PROD-DB01\SQL2022"
@@ -53,7 +53,7 @@
     Created: 2025-06-21
     Modified: 2025-06-26
     Change Log:
-    - v2.8: Added logging for all bound parameters when -DebugMode is used.
+    - v2.8: Added parameter logging in -DebugMode to both console and the execution log file.
     - v2.7: Reworked parameter handling to remove strict parameter sets. Added input precedence logic (Adhoc > File > Folder > Interactive) and ignore empty -AdhocSQL value.
     - v2.6: Suppressed opening the main analysis folder when -OpenTunedFile is used, unless in -DebugMode.
     - v2.5: Added -OpenTunedFile switch to automatically open the final output file.
@@ -1002,10 +1002,12 @@ function Start-Optimus {
     # Define the current version of the script in one place.
     $script:CurrentVersion = "2.8"
 
-    if ($DebugMode) { 
-        Write-Log -Message "Starting Optimus v$($script:CurrentVersion) in Debug Mode." -Level 'DEBUG'
+    if ($DebugMode) { Write-Log -Message "Starting Optimus v$($script:CurrentVersion) in Debug Mode." -Level 'DEBUG' }
 
-        Write-Log -Message "Logging bound parameters..." -Level 'DEBUG'
+    # Capture bound parameters into a string for logging if DebugMode is enabled.
+    $parameterLogString = ""
+    if ($DebugMode) {
+        $logEntries = @("--- Script Parameters For This Batch ---")
         if ($PSBoundParameters.Count -gt 0) {
             $PSBoundParameters.GetEnumerator() | ForEach-Object {
                 $paramName = $_.Key
@@ -1020,11 +1022,12 @@ function Start-Optimus {
                     $paramValue = "'$($paramValue -join "', '")'"
                 }
                 
-                Write-Log -Message "  -> Parameter: '$($paramName)' = '$($paramValue)'" -Level 'DEBUG'
+                $logEntries += "  -> '$($paramName)' = '$($paramValue)'"
             }
         } else {
-            Write-Log -Message "  -> No parameters were bound." -Level 'DEBUG'
+            $logEntries += "  No parameters were bound for this run."
         }
+        $parameterLogString = $logEntries -join "`r`n"
     }
 
     # Group prerequisite checks
@@ -1163,6 +1166,11 @@ function Start-Optimus {
                 $script:LogFilePath = Join-Path -Path $script:AnalysisPath -ChildPath "ExecutionLog.txt"
                 "# Optimus v$($script:CurrentVersion) Execution Log | File: $baseName | Started: $(Get-Date)" | Out-File -FilePath $script:LogFilePath -Encoding utf8
                 
+                # Log the captured parameters if DebugMode is on
+                if (-not [string]::IsNullOrEmpty($parameterLogString)) {
+                    Write-Log -Message $parameterLogString -Level 'DEBUG'
+                }
+
                 Write-Log -Message "Created analysis directory: '$($script:AnalysisPath)'" -Level 'INFO'
                 $sqlVersion = Get-SqlServerVersion -ServerInstance $selectedServer
                 Write-Log -Message "Detected SQL Server Version: $sqlVersion" -Level 'DEBUG'
