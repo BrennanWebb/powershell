@@ -1,4 +1,70 @@
-#V18.11
+<#
+.SYNOPSIS
+    Copies a SQL Server table's schema and data from a source to a target server using four-part naming.
+
+.DESCRIPTION
+    This script facilitates the migration of a SQL Server table, including its schema and data, from a source to a target destination. It uses four-part naming convention ([Server].[Database].[Schema].[Table]) to identify the source and target.
+
+    The script offers two modes for schema creation on the target:
+    1.  Full Schema: Replicates the source table's structure precisely, including data types, primary keys, indexes, IDENTITY properties, and computed columns.
+    2.  NVARCHAR(MAX) Schema: Creates a simplified version of the table where all columns are of the NVARCHAR(MAX) data type. This is useful for quick data staging or when the exact schema is not required.
+
+    Key Features:
+    - Supports both full table and partial (TOP N rows) data transfer.
+    - Handles existing target tables by prompting the user to truncate or append data.
+    - Correctly manages IDENTITY_INSERT when replicating tables with IDENTITY columns in full schema mode.
+    - Provides robust error handling and color-coded console output for clarity.
+    - Includes a -DebugMode switch for detailed execution tracing.
+
+.PARAMETER Source
+    The full four-part name of the source table in the format [Server].[Database].[Schema].[Table]. Brackets are optional.
+
+.PARAMETER Target
+    The full four-part name of the target table in the format [Server].[Database].[Schema].[Table]. Brackets are optional.
+
+.PARAMETER SampleSize
+    Specifies the number of rows to copy (TOP N). A value of 0 (the default) copies all rows.
+
+.PARAMETER SchemaOption
+    Determines how the target table's schema is created if it does not exist.
+    - '1' (Default): Full schema replication (data types, PK, indexes, IDENTITY, computed columns).
+    - '2': Simplified schema where all columns are created as NVARCHAR(MAX).
+
+.PARAMETER DebugMode
+    A switch that, when present, enables verbose debugging output. This output includes generated SQL, variable states, and function traces.
+
+.EXAMPLE
+    .\BulkCopyServerTable.ps1 -Source "SQL01.SalesDB.dbo.Orders" -Target "SQL02.SalesArchive.dbo.Orders_2024" -SchemaOption 1
+    This command copies the entire 'Orders' table from SQL01 to SQL02, replicating the full schema.
+
+.EXAMPLE
+    .\BulkCopyServerTable.ps1 -Source "[SQL01].[SalesDB].[dbo].[Customers]" -Target "[SQL_STG].[Staging].[dbo].[Customers]" -SampleSize 1000 -SchemaOption 2
+    This command copies the top 1000 rows from the 'Customers' table into a staging table where all columns will be NVARCHAR(MAX).
+
+.EXAMPLE
+    .\BulkCopyServerTable.ps1 -DebugMode
+    This command runs the script in interactive mode, prompting the user for all inputs, and enables detailed debug logging.
+#>
+[CmdletBinding()]
+param (
+    [Parameter(Mandatory = $false)]
+    [string]$Source,
+
+    [Parameter(Mandatory = $false)]
+    [string]$Target,
+
+    [Parameter(Mandatory = $false)]
+    [int]$SampleSize = 0,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateSet('1', '2')]
+    [string]$SchemaOption = '1',
+
+    [Parameter(Mandatory = $false)]
+    [switch]$DebugMode
+)
+
+# V19.0
 # Purpose:
 #   Copies a SQL Server table's schema and data from a source to a target using four-part naming
 #   (Server.Database.Schema.Table). Replicates table structure or creates a simplified schema
@@ -13,35 +79,35 @@
 #   - Replicates schema (full or simplified) and transfers data with SqlBulkCopy.
 #
 # Key Features:
-#   - Handles IDENTITY columns with explicit insertion (SET IDENTITY_INSERT, KeepIdentity) for full schema,
-#     including seed/increment detection, data validation, and existing table checks.
-#   - Supports computed columns (persisted and non-persisted) with accurate definitions for full schema,
-#     or materializes their values as NVARCHAR(MAX) in simplified schema.
-#   - Excludes computed columns from data insertion in full schema mode, with their values computed in the target.
+#   - Fully parameterized for automation with interactive fallback.
+#   - Get-Help compatible documentation.
+#   - -DebugMode switch for verbose execution tracing.
+#   - Handles IDENTITY columns with explicit insertion (SET IDENTITY_INSERT, KeepIdentity) for full schema.
+#   - Supports computed columns (persisted and non-persisted) with accurate definitions for full schema.
 #   - Replicates clustered and nonclustered rowstore indexes for full schema.
 #   - Supports a wide range of SQL Server data types, with warnings for deprecated types (e.g., text).
-#   - Prompts user to choose between full schema replication or creating target table with all columns
-#     (including computed) as NVARCHAR(MAX), excluding IDENTITY, PKs, and indexes in simplified mode.
 #   - Allows target table in NVARCHAR(MAX) mode to have a subset of source columns, mapping only
 #     matching columns for data transfer.
-#   - Checks if target table exists, verifies schema compatibility, checks for data, and prompts
-#     user to truncate (TRUNCATE TABLE) or insert additional records if data exists.
 #   - Uses SqlBulkCopy with connection string constructor for reliable data transfer.
-#   - Provides user prompts for source, target, sample size, schema option, and truncate/insert,
-#     with robust error handling.
 #   - Supports recursive execution with user prompt to restart (Y) or exit (Enter) after each run.
-#   - Streamlined output with color-coded messages: errors (red), info (cyan), warnings (yellow),
-#     successes (green), covering main steps and outcomes only.
 #
 # Limitations:
 #   - Does not support columnstore indexes, foreign keys, or full user-defined types (UDTs)/CLR types.
 #   - Requires SQL Server 2017+ due to STRING_AGG usage.
-#   - May fail for UDTs if not defined in the target database.
 #   - IDENTITY_INSERT requires non-null IDENTITY values in source data (full schema only).
-#   - Existing target tables with incompatible schemas will cause errors in full schema mode.
 #   - In NVARCHAR(MAX) mode, data for source columns not present in the target table is skipped.
-#   - NVARCHAR(MAX) mode may produce unreadable data for binary or spatial types.
 #   - Computed columns are materialized as NVARCHAR(MAX) in simplified schema mode, losing their computed logic.
+
+# Function: Write-DebugMessage
+# Purpose: Writes a magenta-colored debug message to the console if DebugMode is enabled.
+function Write-DebugMessage {
+    param(
+        [string]$Message
+    )
+    if ($DebugMode) {
+        Write-Host "[DEBUG] $Message" -ForegroundColor Magenta
+    }
+}
 
 # Function: Parse-FourPartName
 # Purpose: Parses a four-part table name (Server.Database.Schema.Table) into components,
@@ -52,6 +118,7 @@ function Parse-FourPartName {
         [ValidateNotNullOrEmpty()]
         [string]$InputName
     )
+    Write-DebugMessage "Parsing four-part name: $InputName"
 
     # Validate bracket balance to ensure proper syntax
     $openBrackets = ($InputName.ToCharArray() | Where-Object { $_ -eq '[' }).Count
@@ -74,12 +141,14 @@ function Parse-FourPartName {
     }
 
     # Return a hashtable with the parsed components
-    return @{
+    $result = @{
         Server   = $cleanParts[0]
         Database = $cleanParts[1]
         Schema   = $cleanParts[2]
         Table    = $cleanParts[3]
     }
+    Write-DebugMessage "Parsed result: Server=$($result.Server), Database=$($result.Database), Schema=$($result.Schema), Table=$($result.Table)"
+    return $result
 }
 
 # Function: Get-ConnectionString
@@ -91,7 +160,9 @@ function Get-ConnectionString {
         [string]$FourPartName
     )
     $parsed = Parse-FourPartName $FourPartName
-    return "Server=$($parsed.Server);Database=$($parsed.Database);Integrated Security=True;Connect Timeout=15"
+    $connStr = "Server=$($parsed.Server);Database=$($parsed.Database);Integrated Security=True;Connect Timeout=15"
+    Write-DebugMessage "Generated Connection String for $($parsed.Server): $connStr"
+    return $connStr
 }
 
 # Function: Get-TableSchema
@@ -104,6 +175,7 @@ function Get-TableSchema {
         [System.Data.SqlClient.SqlConnection]$Connection
     )
     $parsed = Parse-FourPartName $FourPartName
+    Write-DebugMessage "Getting table schema for [$($parsed.Schema)].[$($parsed.Table)]"
 
     # Query column metadata
     $colCmd = $Connection.CreateCommand()
@@ -142,6 +214,7 @@ ORDER BY c.ORDINAL_POSITION
 "@
     $colCmd.Parameters.AddWithValue("@Schema", $parsed.Schema) | Out-Null
     $colCmd.Parameters.AddWithValue("@Table", $parsed.Table) | Out-Null
+    Write-DebugMessage "Executing schema query for table: $($parsed.Table)"
     $adapter = New-Object System.Data.SqlClient.SqlDataAdapter $colCmd
     $schemaTable = New-Object System.Data.DataTable
     $adapter.Fill($schemaTable) | Out-Null
@@ -168,6 +241,7 @@ HAVING STRING_AGG(CASE WHEN ic.is_included_column = 0 THEN c.name ELSE NULL END,
 "@
     $idxCmd.Parameters.AddWithValue("@Schema", $parsed.Schema) | Out-Null
     $idxCmd.Parameters.AddWithValue("@Table", $parsed.Table) | Out-Null
+    Write-DebugMessage "Executing index query for table: $($parsed.Table)"
     $idxAdapter = New-Object System.Data.SqlClient.SqlDataAdapter $idxCmd
     $indexTable = New-Object System.Data.DataTable
     $idxAdapter.Fill($indexTable) | Out-Null
@@ -187,6 +261,8 @@ WHERE s.name = @Schema AND t.name = @Table AND i.is_primary_key = 1
     $pkIsClustered = $pkCmd.ExecuteScalar()
     if ($null -eq $pkIsClustered) { $pkIsClustered = 0 }
 
+    Write-DebugMessage "Found $($schemaTable.Rows.Count) columns, $($indexTable.Rows.Count) indexes. PK Clustered: $pkIsClustered"
+
     return @{
         SchemaTable = $schemaTable
         IndexTable = $indexTable
@@ -204,11 +280,13 @@ function Compare-TableSchemas {
         [System.Data.DataTable]$TargetIndexes,
         [int]$SourcePkIsClustered,
         [int]$TargetPkIsClustered,
-        [int]$SchemaOption
+        [string]$SchemaOptionToCompare
     )
+    Write-DebugMessage "Comparing schemas with SchemaOption: $SchemaOptionToCompare"
 
-    if ($SchemaOption -eq 2) {
+    if ($SchemaOptionToCompare -eq '2') {
         # NVARCHAR(MAX) mode: Check target columns are a subset of source and NVARCHAR(MAX)
+        Write-DebugMessage "Comparing in NVARCHAR(MAX) mode."
         $sourceCols = $SourceSchema.Rows | Select-Object -ExpandProperty COLUMN_NAME | Sort-Object
         $targetCols = $TargetSchema.Rows | Select-Object -ExpandProperty COLUMN_NAME | Sort-Object
         $missingCols = $sourceCols | Where-Object { $targetCols -notcontains $_ }
@@ -236,12 +314,14 @@ function Compare-TableSchemas {
         if ($TargetIndexes.Rows.Count -gt 0) {
             return "Target table has indexes, which are not allowed in NVARCHAR(MAX) mode."
         }
+        Write-DebugMessage "NVARCHAR(MAX) schema is compatible. Missing source columns in target: $($missingCols -join ', ')"
         return @{
             IsCompatible = $true
             MissingColumns = $missingCols
         } # Schemas compatible, with possible missing columns
     } else {
         # Full schema mode: Exact match
+        Write-DebugMessage "Comparing in Full Schema mode."
         if ($SourceSchema.Rows.Count -ne $TargetSchema.Rows.Count) {
             return "Column count mismatch: Source ($($SourceSchema.Rows.Count)) vs Target ($($TargetSchema.Rows.Count))."
         }
@@ -250,74 +330,38 @@ function Compare-TableSchemas {
         for ($i = 0; $i -lt $sourceCols.Count; $i++) {
             $src = $sourceCols[$i]
             $tgt = $targetCols[$i]
-            if ($src.COLUMN_NAME -ne $tgt.COLUMN_NAME) {
-                return "Column name mismatch: Source [$($src.COLUMN_NAME)] vs Target [$($tgt.COLUMN_NAME)]."
-            }
-            if ($src.DATA_TYPE -ne $tgt.DATA_TYPE) {
-                return "Data type mismatch for [$($src.COLUMN_NAME)]: Source [$($src.DATA_TYPE)] vs Target [$($tgt.DATA_TYPE)]."
-            }
-            if ($src.CHARACTER_MAXIMUM_LENGTH -ne $tgt.CHARACTER_MAXIMUM_LENGTH) {
-                return "Length mismatch for [$($src.COLUMN_NAME)]: Source [$($src.CHARACTER_MAXIMUM_LENGTH)] vs Target [$($tgt.CHARACTER_MAXIMUM_LENGTH)]."
-            }
-            if ($src.NUMERIC_PRECISION -ne $tgt.NUMERIC_PRECISION) {
-                return "Precision mismatch for [$($src.COLUMN_NAME)]: Source [$($src.NUMERIC_PRECISION)] vs Target [$($tgt.NUMERIC_PRECISION)]."
-            }
-            if ($src.NUMERIC_SCALE -ne $tgt.NUMERIC_SCALE) {
-                return "Scale mismatch for [$($src.COLUMN_NAME)]: Source [$($src.NUMERIC_SCALE)] vs Target [$($tgt.NUMERIC_SCALE)]."
-            }
-            if ($src.DATETIME_PRECISION -ne $tgt.DATETIME_PRECISION) {
-                return "Datetime precision mismatch for [$($src.COLUMN_NAME)]: Source [$($src.DATETIME_PRECISION)] vs Target [$($tgt.DATETIME_PRECISION)]."
-            }
-            if ($src.IS_NULLABLE -ne $tgt.IS_NULLABLE) {
-                return "Nullability mismatch for [$($src.COLUMN_NAME)]: Source [$($src.IS_NULLABLE)] vs Target [$($tgt.IS_NULLABLE)]."
-            }
-            if ($src.IS_PRIMARY_KEY -ne $tgt.IS_PRIMARY_KEY) {
-                return "Primary key status mismatch for [$($src.COLUMN_NAME)]: Source [$($src.IS_PRIMARY_KEY)] vs Target [$($tgt.IS_PRIMARY_KEY)]."
-            }
-            if ($src.IS_COMPUTED -ne $tgt.IS_COMPUTED) {
-                return "Computed column status mismatch for [$($src.COLUMN_NAME)]: Source [$($src.IS_COMPUTED)] vs Target [$($tgt.IS_COMPUTED)]."
-            }
+            if ($src.COLUMN_NAME -ne $tgt.COLUMN_NAME) { return "Column name mismatch: Source [$($src.COLUMN_NAME)] vs Target [$($tgt.COLUMN_NAME)]." }
+            if ($src.DATA_TYPE -ne $tgt.DATA_TYPE) { return "Data type mismatch for [$($src.COLUMN_NAME)]: Source [$($src.DATA_TYPE)] vs Target [$($tgt.DATA_TYPE)]." }
+            if ($src.CHARACTER_MAXIMUM_LENGTH -ne $tgt.CHARACTER_MAXIMUM_LENGTH) { return "Length mismatch for [$($src.COLUMN_NAME)]: Source [$($src.CHARACTER_MAXIMUM_LENGTH)] vs Target [$($tgt.CHARACTER_MAXIMUM_LENGTH)]." }
+            if ($src.NUMERIC_PRECISION -ne $tgt.NUMERIC_PRECISION) { return "Precision mismatch for [$($src.COLUMN_NAME)]: Source [$($src.NUMERIC_PRECISION)] vs Target [$($tgt.NUMERIC_PRECISION)]." }
+            if ($src.NUMERIC_SCALE -ne $tgt.NUMERIC_SCALE) { return "Scale mismatch for [$($src.COLUMN_NAME)]: Source [$($src.NUMERIC_SCALE)] vs Target [$($tgt.NUMERIC_SCALE)]." }
+            if ($src.DATETIME_PRECISION -ne $tgt.DATETIME_PRECISION) { return "Datetime precision mismatch for [$($src.COLUMN_NAME)]: Source [$($src.DATETIME_PRECISION)] vs Target [$($tgt.DATETIME_PRECISION)]." }
+            if ($src.IS_NULLABLE -ne $tgt.IS_NULLABLE) { return "Nullability mismatch for [$($src.COLUMN_NAME)]: Source [$($src.IS_NULLABLE)] vs Target [$($tgt.IS_NULLABLE)]." }
+            if ($src.IS_PRIMARY_KEY -ne $tgt.IS_PRIMARY_KEY) { return "Primary key status mismatch for [$($src.COLUMN_NAME)]: Source [$($src.IS_PRIMARY_KEY)] vs Target [$($tgt.IS_PRIMARY_KEY)]." }
+            if ($src.IS_COMPUTED -ne $tgt.IS_COMPUTED) { return "Computed column status mismatch for [$($src.COLUMN_NAME)]: Source [$($src.IS_COMPUTED)] vs Target [$($tgt.IS_COMPUTED)]." }
             if ($src.IS_COMPUTED -eq 1) {
-                if ($src.COMPUTED_DEFINITION -ne $tgt.COMPUTED_DEFINITION) {
-                    return "Computed column definition mismatch for [$($src.COLUMN_NAME)]."
-                }
-                if ($src.IS_PERSISTED -ne $tgt.IS_PERSISTED) {
-                    return "Computed column persisted status mismatch for [$($src.COLUMN_NAME)]: Source [$($src.IS_PERSISTED)] vs Target [$($src.IS_PERSISTED)]."
-                }
+                if ($src.COMPUTED_DEFINITION -ne $tgt.COMPUTED_DEFINITION) { return "Computed column definition mismatch for [$($src.COLUMN_NAME)]." }
+                if ($src.IS_PERSISTED -ne $tgt.IS_PERSISTED) { return "Computed column persisted status mismatch for [$($src.COLUMN_NAME)]: Source [$($src.IS_PERSISTED)] vs Target [$($src.IS_PERSISTED)]." }
             }
-            if ($src.IS_IDENTITY -ne $tgt.IS_IDENTITY) {
-                return "IDENTITY status mismatch for [$($src.COLUMN_NAME)]: Source [$($src.IS_IDENTITY)] vs Target [$($tgt.IS_IDENTITY)]."
-            }
+            if ($src.IS_IDENTITY -ne $tgt.IS_IDENTITY) { return "IDENTITY status mismatch for [$($src.COLUMN_NAME)]: Source [$($src.IS_IDENTITY)] vs Target [$($tgt.IS_IDENTITY)]." }
             if ($src.IS_IDENTITY -eq 1) {
-                if ($src.IDENTITY_SEED -ne $tgt.IDENTITY_SEED -or $src.IDENTITY_INCREMENT -ne $tgt.IDENTITY_INCREMENT) {
-                    return "IDENTITY properties mismatch for [$($src.COLUMN_NAME)]: Source [IDENTITY($($src.IDENTITY_SEED),$($src.IDENTITY_INCREMENT))] vs Target [IDENTITY($($tgt.IDENTITY_SEED),$($tgt.IDENTITY_INCREMENT))]."
-                }
+                if ($src.IDENTITY_SEED -ne $tgt.IDENTITY_SEED -or $src.IDENTITY_INCREMENT -ne $tgt.IDENTITY_INCREMENT) { return "IDENTITY properties mismatch for [$($src.COLUMN_NAME)]: Source [IDENTITY($($src.IDENTITY_SEED),$($src.IDENTITY_INCREMENT))] vs Target [IDENTITY($($tgt.IDENTITY_SEED),$($tgt.IDENTITY_INCREMENT))]." }
             }
         }
-        if ($SourcePkIsClustered -ne $TargetPkIsClustered) {
-            return "Primary key clustering mismatch: Source [IsClustered=$SourcePkIsClustered] vs Target [IsClustered=$TargetPkIsClustered]."
-        }
-        if ($SourceIndexes.Rows.Count -ne $TargetIndexes.Rows.Count) {
-            return "Index count mismatch: Source ($($SourceIndexes.Rows.Count)) vs Target ($($TargetIndexes.Rows.Count))."
-        }
+        if ($SourcePkIsClustered -ne $TargetPkIsClustered) { return "Primary key clustering mismatch: Source [IsClustered=$SourcePkIsClustered] vs Target [IsClustered=$TargetPkIsClustered]." }
+        if ($SourceIndexes.Rows.Count -ne $TargetIndexes.Rows.Count) { return "Index count mismatch: Source ($($SourceIndexes.Rows.Count)) vs Target ($($TargetIndexes.Rows.Count))." }
+        
         $sourceIdx = $SourceIndexes.Rows | Sort-Object KeyColumns, IncludedColumns
         $targetIdx = $TargetIndexes.Rows | Sort-Object KeyColumns, IncludedColumns
         for ($i = 0; $i -lt $sourceIdx.Count; $i++) {
             $src = $sourceIdx[$i]
             $tgt = $targetIdx[$i]
-            if ($src.IndexType -ne $tgt.IndexType) {
-                return "Index type mismatch for index: Source [Type=$($src.IndexType)] vs Target [Type=$($tgt.IndexType)]."
-            }
-            if ($src.IsUnique -ne $tgt.IsUnique) {
-                return "Index uniqueness mismatch for index: Source [IsUnique=$($src.IsUnique)] vs Target [IsUnique=$($tgt.IsUnique)]."
-            }
-            if ($src.KeyColumns -ne $tgt.KeyColumns) {
-                return "Index key columns mismatch: Source [$($src.KeyColumns)] vs Target [$($tgt.KeyColumns)]."
-            }
-            if ($src.IncludedColumns -ne $tgt.IncludedColumns) {
-                return "Index included columns mismatch: Source [$($src.IncludedColumns)] vs Target [$($tgt.IncludedColumns)]."
-            }
+            if ($src.IndexType -ne $tgt.IndexType) { return "Index type mismatch for index: Source [Type=$($src.IndexType)] vs Target [Type=$($tgt.IndexType)]." }
+            if ($src.IsUnique -ne $tgt.IsUnique) { return "Index uniqueness mismatch for index: Source [IsUnique=$($src.IsUnique)] vs Target [IsUnique=$($tgt.IsUnique)]." }
+            if ($src.KeyColumns -ne $tgt.KeyColumns) { return "Index key columns mismatch: Source [$($src.KeyColumns)] vs Target [$($tgt.KeyColumns)]." }
+            if ($src.IncludedColumns -ne $tgt.IncludedColumns) { return "Index included columns mismatch: Source [$($src.IncludedColumns)] vs Target [$($tgt.IncludedColumns)]." }
         }
+        Write-DebugMessage "Full schema comparison passed. Schemas match."
         return $null # Schemas match
     }
 }
@@ -342,6 +386,7 @@ function Get-DataTable {
     } else {
         "SELECT * FROM [$($parsed.Schema)].[$($parsed.Table)]"
     }
+    Write-DebugMessage "Executing data retrieval query: $query"
 
     # Execute the query and fill a DataTable
     $cmd = $conn.CreateCommand()
@@ -351,13 +396,14 @@ function Get-DataTable {
     $table = New-Object System.Data.DataTable
     try {
         $conn.Open()
-        $adapter.Fill($table) | Out-Null
+        [void]$adapter.Fill($table)
     } catch {
         throw "Failed to fetch data from [$($parsed.Schema)].[$($parsed.Table)]: $_"
     } finally {
         $conn.Close()
         $conn.Dispose()
     }
+    Write-DebugMessage "Retrieved $($table.Rows.Count) rows from source."
     return $table
 }
 
@@ -371,7 +417,7 @@ function BulkInsert-DataTable {
         [ValidateNotNullOrEmpty()]
         [string]$TargetFourPartName,
         [System.Data.DataTable]$DataTable,
-        [int]$SchemaOption
+        [string]$SchemaOptionToUse
     )
     # Parse source and target four-part names and get connection strings
     $src = Parse-FourPartName $SourceFourPartName
@@ -400,15 +446,18 @@ function BulkInsert-DataTable {
     # Adjust DataTable: Keep only columns from source schema
     $validCols = $schemaTable.Rows | Select-Object -ExpandProperty COLUMN_NAME
     $colsToRemove = $DataTable.Columns | Select-Object -ExpandProperty ColumnName | Where-Object { $validCols -notcontains $_ }
-    foreach ($col in $colsToRemove) {
-        $DataTable.Columns.Remove($col)
+    if ($colsToRemove) {
+        Write-DebugMessage "Removing columns from in-memory DataTable that are not in source schema: $($colsToRemove -join ', ')"
+        foreach ($col in $colsToRemove) {
+            $DataTable.Columns.Remove($col)
+        }
     }
 
     # Check for IDENTITY and computed columns
     $identityCols = $schemaTable.Rows | Where-Object { $_.IS_IDENTITY -eq 1 } | Select-Object -ExpandProperty COLUMN_NAME
     $computedCols = $schemaTable.Rows | Where-Object { $_.IS_COMPUTED -eq 1 } | Select-Object -ExpandProperty COLUMN_NAME
     $useIdentityInsert = $false
-    if ($SchemaOption -eq 1 -and $identityCols.Count -gt 0) {
+    if ($SchemaOptionToUse -eq '1' -and $identityCols.Count -gt 0) {
         foreach ($identityCol in $identityCols) {
             if (-not $DataTable.Columns.Contains($identityCol)) {
                 Write-Host "WARNING: IDENTITY column [$identityCol] missing in source data. Proceeding without IDENTITY_INSERT." -ForegroundColor Yellow
@@ -424,18 +473,19 @@ function BulkInsert-DataTable {
                     Write-Host "WARNING: IDENTITY column [$identityCol] contains null or invalid values. Proceeding without IDENTITY_INSERT." -ForegroundColor Yellow
                 } else {
                     $useIdentityInsert = $true
+                    Write-DebugMessage "IDENTITY column [$identityCol] has valid data. Will use IDENTITY_INSERT."
                 }
             }
         }
         if ($computedCols.Count -gt 0) {
-            Write-Host "WARNING: Computed columns [$($computedCols -join ', ')] in source table [$($src.Schema)].[$($src.Table)] will have their values computed in the target and are excluded from data insertion." -ForegroundColor Yellow
+            Write-Host "WARNING: Computed columns [$($computedCols -join ', ')] will have their values computed in the target and are excluded from data insertion." -ForegroundColor Yellow
         }
-    } elseif ($SchemaOption -eq 2) {
+    } elseif ($SchemaOptionToUse -eq '2') {
         if ($identityCols.Count -gt 0) {
-            Write-Host "WARNING: IDENTITY columns [$($identityCols -join ', ')] in source table [$($src.Schema)].[$($src.Table)] will be NVARCHAR(MAX) in target." -ForegroundColor Yellow
+            Write-Host "WARNING: IDENTITY columns [$($identityCols -join ', ')] will be NVARCHAR(MAX) in target." -ForegroundColor Yellow
         }
         if ($computedCols.Count -gt 0) {
-            Write-Host "WARNING: Computed columns [$($computedCols -join ', ')] in source table [$($src.Schema)].[$($src.Table)] will be materialized as NVARCHAR(MAX) in target." -ForegroundColor Yellow
+            Write-Host "WARNING: Computed columns [$($computedCols -join ', ')] will be materialized as NVARCHAR(MAX) in target." -ForegroundColor Yellow
         }
     }
 
@@ -443,13 +493,11 @@ function BulkInsert-DataTable {
     $tgtConn = New-Object System.Data.SqlClient.SqlConnection $tgtConnStr
     try {
         $tgtConn.Open()
+        Write-DebugMessage "Successfully connected to target server: $($tgt.Server)"
 
         # Check if target table exists
         $checkCmd = $tgtConn.CreateCommand()
-        $checkCmd.CommandText = @"
-SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
-WHERE TABLE_SCHEMA = @Schema AND TABLE_NAME = @Table
-"@
+        $checkCmd.CommandText = "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = @Schema AND TABLE_NAME = @Table"
         $checkCmd.Parameters.AddWithValue("@Schema", $tgt.Schema) | Out-Null
         $checkCmd.Parameters.AddWithValue("@Table", $tgt.Table) | Out-Null
         $exists = $checkCmd.ExecuteScalar()
@@ -467,8 +515,9 @@ WHERE TABLE_SCHEMA = @Schema AND TABLE_NAME = @Table
             $schemaCheck = Compare-TableSchemas -SourceSchema $schemaTable -TargetSchema $tgtSchemaTable `
                 -SourceIndexes $indexTable -TargetIndexes $tgtIndexTable `
                 -SourcePkIsClustered $pkIsClustered -TargetPkIsClustered $tgtPkIsClustered `
-                -SchemaOption $SchemaOption
-            if ($SchemaOption -eq 2) {
+                -SchemaOptionToCompare $SchemaOptionToUse
+            
+            if ($SchemaOptionToUse -eq '2') {
                 if (-not $schemaCheck.IsCompatible) {
                     Write-Host "WARNING: Schema mismatch between source and target: $($schemaCheck)" -ForegroundColor Yellow
                     throw "Cannot proceed due to incompatible target table schema."
@@ -476,17 +525,17 @@ WHERE TABLE_SCHEMA = @Schema AND TABLE_NAME = @Table
                 if ($schemaCheck.MissingColumns) {
                     Write-Host "WARNING: Target table [$($tgt.Schema)].[$($tgt.Table)] is missing columns [$($schemaCheck.MissingColumns -join ', ')]. Data for these columns will be skipped." -ForegroundColor Yellow
                 }
-                Write-Host "INFO: Target table schema is compatible for option $SchemaOption (NVARCHAR(MAX) mode)." -ForegroundColor Cyan
+                Write-Host "INFO: Target table schema is compatible for option 2 (NVARCHAR(MAX) mode)." -ForegroundColor Cyan
             } else {
                 if ($schemaCheck) {
                     Write-Host "WARNING: Schema mismatch between source and target: $schemaCheck" -ForegroundColor Yellow
                     throw "Cannot proceed due to incompatible target table schema."
                 }
-                Write-Host "INFO: Target table schema matches expected schema for option $SchemaOption." -ForegroundColor Cyan
+                Write-Host "INFO: Target table schema matches expected schema for option 1." -ForegroundColor Cyan
             }
 
             # Check for IDENTITY columns in target (full schema only)
-            if ($SchemaOption -eq 1) {
+            if ($SchemaOptionToUse -eq '1') {
                 $tgtIdentityCols = $tgtSchemaTable.Rows | Where-Object { $_.IS_IDENTITY -eq 1 } | Select-Object -ExpandProperty COLUMN_NAME
                 if ($tgtIdentityCols.Count -eq 0 -and $useIdentityInsert) {
                     Write-Host "WARNING: Target table [$($tgt.Schema)].[$($tgt.Table)] has no IDENTITY columns. Proceeding without IDENTITY_INSERT." -ForegroundColor Yellow
@@ -500,11 +549,13 @@ WHERE TABLE_SCHEMA = @Schema AND TABLE_NAME = @Table
             $rowCount = $dataCmd.ExecuteScalar()
             if ($rowCount -gt 0) {
                 Write-Host "INFO: Target table contains $rowCount row(s). Prompting for action..." -ForegroundColor Cyan
-                $choice = Read-Host "Target table contains data. Enter 1 to truncate, 2 to insert additional records"
+                Write-Host "Target table contains data. Enter 1 to truncate, 2 to insert additional records: " -ForegroundColor White -NoNewline
+                $choice = Read-Host
                 if ($choice -eq '1') {
                     Write-Host "INFO: User chose to truncate table [$($tgt.Schema)].[$($tgt.Table)]." -ForegroundColor Cyan
                     $truncateCmd = $tgtConn.CreateCommand()
                     $truncateCmd.CommandText = "TRUNCATE TABLE [$($tgt.Schema)].[$($tgt.Table)]"
+                    Write-DebugMessage "Executing TRUNCATE TABLE statement."
                     [void]$truncateCmd.ExecuteNonQuery()
                     Write-Host "SUCCESS: Table [$($tgt.Schema)].[$($tgt.Table)] truncated." -ForegroundColor Green
                 } else {
@@ -514,23 +565,22 @@ WHERE TABLE_SCHEMA = @Schema AND TABLE_NAME = @Table
                 Write-Host "INFO: Target table is empty. Proceeding with data insertion." -ForegroundColor Cyan
             }
         } else {
-            Write-Host "INFO: Target table [$($tgt.Schema)].[$($tgt.Table)] does not exist. Creating new table with schema option $SchemaOption..." -ForegroundColor Cyan
+            Write-Host "INFO: Target table [$($tgt.Schema)].[$($tgt.Table)] does not exist. Creating new table with schema option $SchemaOptionToUse..." -ForegroundColor Cyan
 
-            if ($SchemaOption -eq 2) {
+            if ($SchemaOptionToUse -eq '2') {
                 # NVARCHAR(MAX) mode: Create table with all columns as NVARCHAR(MAX)
                 $cols = @()
                 foreach ($row in $schemaTable.Rows) {
                     $name = $row.COLUMN_NAME
                     $cols += "[$name] NVARCHAR(MAX) NULL"
                 }
-                if ($cols.Count -eq 0) {
-                    throw "No valid column definitions found for [$($tgt.Schema)].[$($tgt.Table)]."
-                }
+                if ($cols.Count -eq 0) { throw "No valid column definitions found for [$($tgt.Schema)].[$($tgt.Table)]." }
                 $createSql = "CREATE TABLE [$($tgt.Schema)].[$($tgt.Table)] (`n" + ($cols -join ",`n") + "`n)"
+                Write-DebugMessage "Executing CREATE TABLE statement (NVARCHAR MAX):`n$createSql"
                 $createCmd = $tgtConn.CreateCommand()
                 $createCmd.CommandText = $createSql
                 [void]$createCmd.ExecuteNonQuery()
-                Write-Host "SUCCESS: Table [$($tgt.Schema)].[$($tgt.Table)] created with all columns (including computed) as NVARCHAR(MAX)." -ForegroundColor Green
+                Write-Host "SUCCESS: Table [$($tgt.Schema)].[$($tgt.Table)] created with all columns as NVARCHAR(MAX)." -ForegroundColor Green
             } else {
                 # Full schema mode
                 $hasClusteredIndex = ($indexTable.Rows | Where-Object { $_.IndexType -eq 1 } | Select-Object -First 1) -or ($pkIsClustered -eq 1)
@@ -541,74 +591,33 @@ WHERE TABLE_SCHEMA = @Schema AND TABLE_NAME = @Table
                 foreach ($row in $schemaTable.Rows) {
                     $name = $row.COLUMN_NAME
                     if ($row.IS_COMPUTED -eq 1) {
-                        if ([string]::IsNullOrWhiteSpace($row.COMPUTED_DEFINITION)) {
-                            throw "Invalid computed column definition for [$name] in [$($src.Schema)].[$($src.Table)]."
-                        }
+                        if ([string]::IsNullOrWhiteSpace($row.COMPUTED_DEFINITION)) { throw "Invalid computed column definition for [$name] in [$($src.Schema)].[$($src.Table)]." }
                         $persisted = if ($row.IS_PERSISTED -eq $true) { ' PERSISTED' } else { '' }
                         $cols += "[$name] AS $($row.COMPUTED_DEFINITION)$persisted"
                     } else {
                         $type = switch ($row.DATA_TYPE) {
-                            'nvarchar' { 
-                                if ($row.CHARACTER_MAXIMUM_LENGTH -gt 0) { "NVARCHAR($($row.CHARACTER_MAXIMUM_LENGTH))" } else { "NVARCHAR(MAX)" }
-                            }
-                            'varchar' { 
-                                if ($row.CHARACTER_MAXIMUM_LENGTH -gt 0) { "VARCHAR($($row.CHARACTER_MAXIMUM_LENGTH))" } else { "VARCHAR(MAX)" }
-                            }
-                            'char' { "CHAR($($row.CHARACTER_MAXIMUM_LENGTH))" }
-                            'nchar' { "NCHAR($($row.CHARACTER_MAXIMUM_LENGTH))" }
-                            'decimal' { "DECIMAL($($row.NUMERIC_PRECISION),$($row.NUMERIC_SCALE))" }
-                            'numeric' { "NUMERIC($($row.NUMERIC_PRECISION),$($row.NUMERIC_SCALE))" }
-                            'varbinary' { 
-                                if ($row.CHARACTER_MAXIMUM_LENGTH -gt 0) { "VARBINARY($($row.CHARACTER_MAXIMUM_LENGTH))" } else { "VARBINARY(MAX)" }
-                            }
-                            'binary' { 
-                                if ($row.CHARACTER_MAXIMUM_LENGTH -gt 0) { "BINARY($($row.CHARACTER_MAXIMUM_LENGTH))" } else { "BINARY(MAX)" }
-                            }
-                            'datetime2' { 
-                                if ($row.DATETIME_PRECISION -gt 0) { "DATETIME2($($row.DATETIME_PRECISION))" } else { "DATETIME2" }
-                            }
-                            'time' { 
-                                if ($row.DATETIME_PRECISION -gt 0) { "TIME($($row.DATETIME_PRECISION))" } else { "TIME" }
-                            }
-                            'int' { 'INT' }
-                            'bigint' { 'BIGINT' }
-                            'smallint' { 'SMALLINT' }
-                            'tinyint' { 'TINYINT' }
-                            'float' { 
-                                if ($row.NUMERIC_PRECISION -gt 0) { "FLOAT($($row.NUMERIC_PRECISION))" } else { "FLOAT" }
-                            }
-                            'real' { 'REAL' }
-                            'money' { 'MONEY' }
-                            'smallmoney' { 'SMALLMONEY' }
-                            'date' { 'DATE' }
-                            'datetime' { 'DATETIME' }
-                            'smalldatetime' { 'SMALLDATETIME' }
-                            'datetimeoffset' { 
-                                if ($row.DATETIME_PRECISION -gt 0) { "DATETIMEOFFSET($($row.DATETIME_PRECISION))" } else { "DATETIMEOFFSET" }
-                            }
-                            'uniqueidentifier' { 'UNIQUEIDENTIFIER' }
-                            'xml' { 'XML' }
-                            'geometry' { 'GEOMETRY' }
-                            'geography' { 'GEOGRAPHY' }
-                            'hierarchyid' { 'HIERARCHYID' }
-                            'timestamp' { 'TIMESTAMP' }
-                            'rowversion' { 'ROWVERSION' }
-                            'sql_variant' { 'SQL_VARIANT' }
-                            'text' { 
-                                Write-Host "WARNING: Deprecated data type 'text' used in [$($src.Schema)].[$($src.Table)]. Consider upgrading." -ForegroundColor Yellow
-                                'TEXT'
-                            }
-                            'ntext' { 
-                                Write-Host "WARNING: Deprecated data type 'ntext' used in [$($src.Schema)].[$($src.Table)]. Consider upgrading." -ForegroundColor Yellow
-                                'NTEXT'
-                            }
-                            'image' { 
-                                Write-Host "WARNING: Deprecated data type 'image' used in [$($src.Schema)].[$($src.Table)]. Consider upgrading." -ForegroundColor Yellow
-                                'IMAGE'
-                            }
-                            default { 
-                                Write-Host "WARNING: Unsupported or user-defined data type '$($row.DATA_TYPE)' in [$($src.Schema)].[$($src.Table)]. Using as-is, which may cause errors." -ForegroundColor Yellow
-                                $row.DATA_TYPE.ToUpper()
+                            'nvarchar'      { if ($row.CHARACTER_MAXIMUM_LENGTH -gt 0) { "NVARCHAR($($row.CHARACTER_MAXIMUM_LENGTH))" } else { "NVARCHAR(MAX)" } }
+                            'varchar'       { if ($row.CHARACTER_MAXIMUM_LENGTH -gt 0) { "VARCHAR($($row.CHARACTER_MAXIMUM_LENGTH))" } else { "VARCHAR(MAX)" } }
+                            'char'          { "CHAR($($row.CHARACTER_MAXIMUM_LENGTH))" }
+                            'nchar'         { "NCHAR($($row.CHARACTER_MAXIMUM_LENGTH))" }
+                            'decimal'       { "DECIMAL($($row.NUMERIC_PRECISION),$($row.NUMERIC_SCALE))" }
+                            'numeric'       { "NUMERIC($($row.NUMERIC_PRECISION),$($row.NUMERIC_SCALE))" }
+                            'varbinary'     { if ($row.CHARACTER_MAXIMUM_LENGTH -gt 0) { "VARBINARY($($row.CHARACTER_MAXIMUM_LENGTH))" } else { "VARBINARY(MAX)" } }
+                            'binary'        { if ($row.CHARACTER_MAXIMUM_LENGTH -gt 0) { "BINARY($($row.CHARACTER_MAXIMUM_LENGTH))" } else { "BINARY(MAX)" } }
+                            'datetime2'     { if ($row.DATETIME_PRECISION -gt 0) { "DATETIME2($($row.DATETIME_PRECISION))" } else { "DATETIME2" } }
+                            'time'          { if ($row.DATETIME_PRECISION -gt 0) { "TIME($($row.DATETIME_PRECISION))" } else { "TIME" } }
+                            'datetimeoffset'{ if ($row.DATETIME_PRECISION -gt 0) { "DATETIMEOFFSET($($row.DATETIME_PRECISION))" } else { "DATETIMEOFFSET" } }
+                            'float'         { if ($row.NUMERIC_PRECISION -gt 0) { "FLOAT($($row.NUMERIC_PRECISION))" } else { "FLOAT" } }
+                            'text'          { Write-Host "WARNING: Deprecated data type 'text' used in [$($src.Schema)].[$($src.Table)]." -ForegroundColor Yellow; 'TEXT' }
+                            'ntext'         { Write-Host "WARNING: Deprecated data type 'ntext' used in [$($src.Schema)].[$($src.Table)]." -ForegroundColor Yellow; 'NTEXT' }
+                            'image'         { Write-Host "WARNING: Deprecated data type 'image' used in [$($src.Schema)].[$($src.Table)]." -ForegroundColor Yellow; 'IMAGE' }
+                            default         {
+                                if (($row.DATA_TYPE -in ('int', 'bigint', 'smallint', 'tinyint', 'real', 'money', 'smallmoney', 'date', 'datetime', 'smalldatetime', 'uniqueidentifier', 'xml', 'geometry', 'geography', 'hierarchyid', 'timestamp', 'rowversion', 'sql_variant'))) {
+                                    $row.DATA_TYPE.ToUpper()
+                                } else {
+                                    Write-Host "WARNING: Potentially unsupported data type '$($row.DATA_TYPE)'. Using as-is." -ForegroundColor Yellow
+                                    $row.DATA_TYPE.ToUpper()
+                                }
                             }
                         }
                         $identity = ''
@@ -616,7 +625,7 @@ WHERE TABLE_SCHEMA = @Schema AND TABLE_NAME = @Table
                             if ($null -ne $row.IDENTITY_SEED -and $null -ne $row.IDENTITY_INCREMENT) {
                                 $identity = " IDENTITY($($row.IDENTITY_SEED),$($row.IDENTITY_INCREMENT))"
                             } else {
-                                Write-Host "WARNING: IDENTITY column [$name] in [$($src.Schema)].[$($src.Table)] has missing seed/increment values. Defaulting to IDENTITY(1,1)." -ForegroundColor Yellow
+                                Write-Host "WARNING: IDENTITY column [$name] has missing seed/increment values. Defaulting to IDENTITY(1,1)." -ForegroundColor Yellow
                                 $identity = " IDENTITY(1,1)"
                             }
                         }
@@ -627,14 +636,13 @@ WHERE TABLE_SCHEMA = @Schema AND TABLE_NAME = @Table
                         $pkCols += "[$name]"
                     }
                 }
-                if ($cols.Count -eq 0) {
-                    throw "No valid column definitions found for [$($tgt.Schema)].[$($tgt.Table)]."
-                }
+                if ($cols.Count -eq 0) { throw "No valid column definitions found for [$($tgt.Schema)].[$($tgt.Table)]." }
                 $createSql = "CREATE TABLE [$($tgt.Schema)].[$($tgt.Table)] (`n" + ($cols -join ",`n")
                 if ($pkCols.Count -gt 0) {
                     $createSql += ",`nCONSTRAINT [PK_$($tgt.Table)] PRIMARY KEY $primaryKeyType (" + ($pkCols -join ', ') + ")"
                 }
                 $createSql += "`n)"
+                Write-DebugMessage "Executing CREATE TABLE statement (Full Schema):`n$createSql"
                 $createCmd = $tgtConn.CreateCommand()
                 $createCmd.CommandText = $createSql
                 [void]$createCmd.ExecuteNonQuery()
@@ -642,21 +650,14 @@ WHERE TABLE_SCHEMA = @Schema AND TABLE_NAME = @Table
 
                 # Create indexes
                 foreach ($idx in $indexTable.Rows) {
-                    $idxName = $idx.IndexName
-                    $isUnique = $idx.IsUnique
-                    $indexKind = $idx.IndexKind
-                    $keyColumns = $idx.KeyColumns
-                    $includedColumns = $idx.IncludedColumns
+                    $idxName = $idx.IndexName; $isUnique = $idx.IsUnique; $indexKind = $idx.IndexKind; $keyColumns = $idx.KeyColumns; $includedColumns = $idx.IncludedColumns
                     if ($indexKind -eq 'CLUSTERED' -and $hasClusteredIndex) {
-                        Write-Host "INFO: Skipping clustered index [$idxName] on [$($tgt.Schema)].[$($tgt.Table)] as a clustered index already exists." -ForegroundColor Cyan
+                        Write-Host "INFO: Skipping clustered index [$idxName] as one already exists." -ForegroundColor Cyan
                         continue
                     }
-                    $idxSql = "CREATE "
-                    if ($isUnique -eq $true) { $idxSql += "UNIQUE " }
-                    $idxSql += "$indexKind INDEX [$idxName] ON [$($tgt.Schema)].[$($tgt.Table)] ($keyColumns)"
-                    if (-not [string]::IsNullOrWhiteSpace($includedColumns)) {
-                        $idxSql += " INCLUDE ($includedColumns)"
-                    }
+                    $idxSql = "CREATE "; if ($isUnique -eq $true) { $idxSql += "UNIQUE " }; $idxSql += "$indexKind INDEX [$idxName] ON [$($tgt.Schema)].[$($tgt.Table)] ($keyColumns)"
+                    if (-not [string]::IsNullOrWhiteSpace($includedColumns)) { $idxSql += " INCLUDE ($includedColumns)" }
+                    Write-DebugMessage "Executing CREATE INDEX statement:`n$idxSql"
                     $idxCmd = $tgtConn.CreateCommand()
                     $idxCmd.CommandText = $idxSql
                     [void]$idxCmd.ExecuteNonQuery()
@@ -666,41 +667,47 @@ WHERE TABLE_SCHEMA = @Schema AND TABLE_NAME = @Table
         }
 
         # Perform bulk data insertion
-        $bulkCopyOptions = if ($SchemaOption -eq 1 -and $useIdentityInsert) { [System.Data.SqlClient.SqlBulkCopyOptions]::KeepIdentity } else { [System.Data.SqlClient.SqlBulkCopyOptions]::Default }
+        $bulkCopyOptions = if ($SchemaOptionToUse -eq '1' -and $useIdentityInsert) { [System.Data.SqlClient.SqlBulkCopyOptions]::KeepIdentity } else { [System.Data.SqlClient.SqlBulkCopyOptions]::Default }
         $bulkCopy = New-Object System.Data.SqlClient.SqlBulkCopy($tgtConnStr, $bulkCopyOptions)
         $bulkCopy.DestinationTableName = "[$($tgt.Schema)].[$($tgt.Table)]"
         $bulkCopy.BatchSize = 10000
         $bulkCopy.BulkCopyTimeout = 600
+        Write-DebugMessage "SqlBulkCopy options: $bulkCopyOptions"
 
         # Map columns: Use non-computed columns for Option 1, target table columns for Option 2
-        $columnsToMap = if ($SchemaOption -eq 2) {
-            $tgtSchemaTable.Rows | Select-Object -ExpandProperty COLUMN_NAME
+        $columnsToMap = if ($SchemaOptionToUse -eq '2') {
+            # In NVARCHAR mode, only map columns that actually exist in the target
+            $tgtSchemaForMapping = Get-TableSchema -FourPartName $TargetFourPartName -Connection $tgtConn
+            $tgtSchemaForMapping.SchemaTable.Rows | Select-Object -ExpandProperty COLUMN_NAME
         } else {
             $schemaTable.Rows | Where-Object { $_.IS_COMPUTED -eq 0 } | Select-Object -ExpandProperty COLUMN_NAME
         }
+        Write-DebugMessage "Mapping columns for bulk copy: $($columnsToMap -join ', ')"
         foreach ($col in $columnsToMap) {
             if ($DataTable.Columns.Contains($col)) {
-                $bulkCopy.ColumnMappings.Add($col, $col) | Out-Null
+                [void]$bulkCopy.ColumnMappings.Add($col, $col)
             }
         }
 
         try {
-            if ($SchemaOption -eq 1 -and $useIdentityInsert) {
+            if ($SchemaOptionToUse -eq '1' -and $useIdentityInsert) {
                 $identityCmd = $tgtConn.CreateCommand()
                 $identityCmd.CommandText = "SET IDENTITY_INSERT [$($tgt.Schema)].[$($tgt.Table)] ON"
                 [void]$identityCmd.ExecuteNonQuery()
                 Write-Host "INFO: IDENTITY_INSERT enabled for [$($tgt.Schema)].[$($tgt.Table)]." -ForegroundColor Cyan
+                Write-DebugMessage "Executed: SET IDENTITY_INSERT ON"
             }
             $bulkCopy.WriteToServer($DataTable)
             Write-Host "SUCCESS: Bulk insert completed successfully." -ForegroundColor Green
         } catch {
             throw "Bulk insert failed: $_"
         } finally {
-            if ($SchemaOption -eq 1 -and $useIdentityInsert) {
+            if ($SchemaOptionToUse -eq '1' -and $useIdentityInsert) {
                 $identityCmd = $tgtConn.CreateCommand()
                 $identityCmd.CommandText = "SET IDENTITY_INSERT [$($tgt.Schema)].[$($tgt.Table)] OFF"
                 [void]$identityCmd.ExecuteNonQuery()
                 Write-Host "INFO: IDENTITY_INSERT disabled for [$($tgt.Schema)].[$($tgt.Table)]." -ForegroundColor Cyan
+                Write-DebugMessage "Executed: SET IDENTITY_INSERT OFF"
             }
         }
     } catch {
@@ -710,76 +717,74 @@ WHERE TABLE_SCHEMA = @Schema AND TABLE_NAME = @Table
         $tgtConn.Dispose()
         if ($bulkCopy) {
             $bulkCopy.Close()
-            $bulkCopy.Dispose()
         }
     }
 }
 
 # Section: Main Execution
-# Purpose: Orchestrates the data transfer by fetching source data into a DataTable
-#          and calling BulkInsert-DataTable for schema replication and data insertion,
-#          with recursive option to restart or exit.
+# Purpose: Orchestrates the data transfer by collecting input, fetching source data,
+#          and calling BulkInsert-DataTable for schema replication and data insertion.
 do {
-    # Section: Runtime Prompts
-    # Purpose: Collects user input for source table, target table, sample size, and schema option,
-    #          validates the input, and initiates the data transfer process.
-    $sourceInput = Read-Host "Enter the source [Server].[Database].[Schema].[Table]"
-    $targetInput = Read-Host "Enter the target [Server].[Database].[Schema].[Table]"
-    $sampleInput = Read-Host "Enter TOP N sample size (0 for full load)"
-    $schemaInput = Read-Host "Enter 1 for full schema (data types, PK, indexes, IDENTITY, computed columns), 2 for NVARCHAR(MAX) columns only"
-    [int]$sampleSize = 0
-    if ($sampleInput -match '^\d+$') {
-        $sampleSize = [int]$sampleInput
-        if ($sampleSize -lt 0) {
-            throw "Sample size cannot be negative: $sampleInput"
+    # If parameters are not provided, fall back to interactive prompts
+    if ([string]::IsNullOrWhiteSpace($Source)) {
+        Write-Host "Enter the source [Server].[Database].[Schema].[Table]: " -ForegroundColor White -NoNewline
+        $Source = Read-Host
+    }
+    if ([string]::IsNullOrWhiteSpace($Target)) {
+        Write-Host "Enter the target [Server].[Database].[Schema].[Table]: " -ForegroundColor White -NoNewline
+        $Target = Read-Host
+    }
+    # These are not mandatory, so we only ask if they were not provided via parameters and their default is still set.
+    # For SampleSize, the default is 0.
+    if ($PSBoundParameters.ContainsKey('SampleSize') -eq $false) {
+        Write-Host "Enter TOP N sample size (0 for full load) [Default: 0]: " -ForegroundColor White -NoNewline
+        $sampleInput = Read-Host
+        if ($sampleInput -match '^\d+$') {
+            $SampleSize = [int]$sampleInput
+        } else {
+            $SampleSize = 0 # Default if input is invalid
         }
     }
-    [int]$schemaOption = 1 # Default to full schema
-    if ($schemaInput -eq '2') {
-        $schemaOption = 2
+    # For SchemaOption, the default is '1'.
+    if ($PSBoundParameters.ContainsKey('SchemaOption') -eq $false) {
+        Write-Host "Enter 1 for full schema, 2 for NVARCHAR(MAX) columns [Default: 1]: " -ForegroundColor White -NoNewline
+        $schemaInput = Read-Host
+        if ($schemaInput -eq '2') {
+            $SchemaOption = '2'
+        } else {
+            $SchemaOption = '1' # Default if input is invalid or 1
+        }
+    }
+
+    if ($SchemaOption -eq '2') {
         Write-Host "INFO: User chose NVARCHAR(MAX) columns for target table." -ForegroundColor Cyan
     } else {
         Write-Host "INFO: User chose full schema replication for target table." -ForegroundColor Cyan
     }
 
     try {
-        Write-Host "INFO: Loading data from $sourceInput..." -ForegroundColor Cyan
-        $data = Get-DataTable -FourPartName $sourceInput -Top $sampleSize
-
-        # Convert array of objects to DataTable if necessary
-        if ($data -is [System.Data.DataTable]) {
-            # Already a DataTable, no action needed
-        } elseif ($data -is [System.Object[]]) {
-            $dt = New-Object System.Data.DataTable
-            if ($data.Length -gt 0) {
-                foreach ($prop in $data[0].PSObject.Properties.Name) {
-                    $dt.Columns.Add($prop) | Out-Null
-                }
-                foreach ($row in $data) {
-                    $newRow = $dt.NewRow()
-                    foreach ($col in $dt.Columns) {
-                        $newRow[$col.ColumnName] = $row.$($col.ColumnName)
-                    }
-                    $dt.Rows.Add($newRow)
-                }
-            }
-            $data = $dt
-        } else {
-            throw "Unexpected type: $($data.GetType().FullName)"
-        }
+        Write-Host "INFO: Loading data from $Source..." -ForegroundColor Cyan
+        $data = Get-DataTable -FourPartName $Source -Top $SampleSize
 
         # Execute the bulk insert operation
-        BulkInsert-DataTable -SourceFourPartName $sourceInput -TargetFourPartName $targetInput -DataTable $data -SchemaOption $schemaOption
+        BulkInsert-DataTable -SourceFourPartName $Source -TargetFourPartName $Target -DataTable $data -SchemaOptionToUse $SchemaOption
 
         Write-Host "SUCCESS: Done. Rows transferred: $($data.Rows.Count)" -ForegroundColor Green
     } catch {
-        Write-Host "ERROR: Error occurred during data transfer: $_" -ForegroundColor Red
+        Write-Host "ERROR: Error occurred during data transfer: $($_.Exception.Message)" -ForegroundColor Red
     }
 
     Write-Host "INFO: Do you want to restart the process? Enter Y to restart, or press Enter to exit" -ForegroundColor Cyan
     $restart = Read-Host
     if ($restart -eq 'Y' -or $restart -eq 'y') {
         Write-Host "INFO: Restarting the process..." -ForegroundColor Cyan
+        # Reset parameters for next loop if running interactively
+        $Source = $null
+        $Target = $null
+        $PSBoundParameters.Remove('SampleSize') | Out-Null
+        $PSBoundParameters.Remove('SchemaOption') | Out-Null
+        $SampleSize = 0
+        $SchemaOption = '1'
     } else {
         Write-Host "SUCCESS: Exiting script." -ForegroundColor Green
     }

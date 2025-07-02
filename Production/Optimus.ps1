@@ -52,10 +52,12 @@
 .NOTES
     Designer: Brennan Webb
     Script Engine: Gemini
-    Version: 2.6
+    Version: 2.7.0
     Created: 2025-06-21
-    Modified: 2025-06-23
+    Modified: 2025-06-26
     Change Log:
+    - v2.7.0: Adopted a three-part (Major.Minor.Patch) versioning scheme for future updates.
+    - v2.7: Added logging for the cleaned T-SQL text before execution plan generation.
     - v2.6: Suppressed opening the main analysis folder when -OpenTunedFile is used, unless in -DebugMode.
     - v2.5: Added -OpenTunedFile switch to automatically open the final output file.
     - v2.4: Minor wording change for AI analysis message.
@@ -694,6 +696,9 @@ function Get-MasterExecutionPlan {
         $cleanQueryText = $cleanQueryText.Substring(0, $cleanQueryText.Length - 2).Trim()
     }
     
+    # Log the exact query text being sent to the log file for debugging and auditing.
+    Write-Log -Message "Cleaned T-SQL for execution plan generation:`n$cleanQueryText" -Level 'DEBUG'
+
     $planQuery = "$planCommand`nGO`n$cleanQueryText"
     try {
         $planResult = Invoke-Sqlcmd -ServerInstance $ServerInstance -Database $dbContextForCheck -TrustServerCertificate -Query $planQuery -MaxCharLength ([int]::MaxValue) -ErrorAction Stop
@@ -1003,7 +1008,7 @@ Timestamp: $(Get-Date)
 # --- Main Application Logic ---
 function Start-Optimus {
     # Define the current version of the script in one place.
-    $script:CurrentVersion = "2.6"
+    $script:CurrentVersion = "2.7.0"
 
     if ($DebugMode) { Write-Log -Message "Starting Optimus v$($script:CurrentVersion) in Debug Mode." -Level 'DEBUG'}
 
