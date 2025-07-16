@@ -3,50 +3,69 @@
     Optimus is a T-SQL tuning advisor that leverages the Gemini AI for performance recommendations.
 
 .DESCRIPTION
-    This script performs a holistic analysis of a T-SQL file. It can process a single file, a list of files, or all .sql files
-    in a specified folder. It generates a master execution plan to validate syntax and identify database objects. It then 
-    queries each required database to build a comprehensive schema document for all user-defined objects. All execution steps, 
+    This script performs a holistic analysis of a T-SQL query. It can process a T-SQL script from a single file, a list of files, all .sql files
+    in a specified folder, or a raw T-SQL string. It generates a master execution plan to validate syntax and identify database objects. It then
+    queries each required database to build a comprehensive schema document for all user-defined objects. All execution steps,
     messages, and recommendations are recorded in a detailed log file for each analysis.
 
 .PARAMETER SQLFile
     The path to one or more .sql files to be analyzed. For multiple files, provide a comma-separated list. This parameter
-    cannot be used with -FolderPath.
+    cannot be used with -FolderPath or -AdhocSQL.
 
 .PARAMETER FolderPath
-    The path to a single folder. The script will analyze all .sql files found in this folder (non-recursively). 
-    This parameter cannot be used with -SQLFile.
+    The path to a single folder. The script will analyze all .sql files found in this folder (non-recursively).
+    This parameter cannot be used with -SQLFile or -AdhocSQL.
+
+.PARAMETER AdhocSQL
+    A string containing the T-SQL query to be analyzed. This is useful for passing queries directly from other applications.
+    This parameter cannot be used with -SQLFile or -FolderPath.
+
+.PARAMETER ServerName
+    An optional parameter to specify the SQL Server instance for the analysis, bypassing the interactive menu.
 
 .PARAMETER UseActualPlan
     An optional switch to generate the 'Actual' execution plan. This WILL execute the query.
     If not present, the script defaults to 'Estimated' or will prompt in interactive mode.
 
+.PARAMETER OpenTunedFile
+    An optional switch that opens the final tuned .sql file using the default OS application (e.g., SSMS) after analysis is complete.
+
 .PARAMETER ResetConfiguration
     An optional switch to trigger an interactive menu that allows for resetting user configurations.
     This can be used to clear the saved API key, server list, and optionally, all past analysis reports.
+
+.PARAMETER UiLogPort
+    For internal use by OptimusUI.exe. When specified, the script sends a copy of all log messages to the specified local UDP port.
 
 .PARAMETER DebugMode
     Enables detailed diagnostic output to the console. All messages are always written to the execution log file regardless of this setting.
 
 .EXAMPLE
     .\Optimus.ps1
-    Runs the script in interactive mode, using a graphical file picker to select files.
+    Runs the script in interactive mode, using a graphical file picker and server selection menu.
 
 .EXAMPLE
-    .\Optimus.ps1 -SQLFile "C:\Scripts\Proc1.sql", "C:\Scripts\Proc2.sql"
-    Runs a batch analysis on the two specified files.
+    .\Optimus.ps1 -FolderPath "C:\My TSQL Projects\Batch1" -ServerName "PROD-DB01\SQL2022"
+    Runs a fully automated analysis on all .sql files in the folder against the specified server.
 
 .EXAMPLE
-    .\Optimus.ps1 -FolderPath "C:\My TSQL Projects\Batch1"
-    Runs a batch analysis on all .sql files located directly within the C:\My TSQL Projects\Batch1 folder.
+    .\Optimus.ps1 -AdhocSQL "SELECT * FROM Sales.SalesOrderHeader WHERE OrderDate > '2011-01-01'" -ServerName "PROD-DB01\SQL2022" -OpenTunedFile
+    Runs a fully automated analysis on the provided T-SQL string and opens the resulting tuned file.
 
 .NOTES
     Designer: Brennan Webb
     Script Engine: Gemini
-    Version: 1.0-preview
+    Version: 2.8.0
     Created: 2025-06-21
-    Modified: 2025-06-21
+    Modified: 2025-07-07
     Change Log:
-    - v1.0-preview: Initial preview release. Re-versioned from legacy builds.
+    - v2.8.0: Added -UiLogPort parameter. When specified, the engine sends all log output to a local UDP port for real-time capture by a GUI. Core interactive functionality is unaffected.
+    - v2.7.0: Adopted a three-part (Major.Minor.Patch) versioning scheme for future updates.
+    - v2.7: Added logging for the cleaned T-SQL text before execution plan generation.
+    - v2.6: Suppressed opening the main analysis folder when -OpenTunedFile is used, unless in -DebugMode.
+    - v2.5: Added -OpenTunedFile switch to automatically open the final output file.
+    - v2.4: Minor wording change for AI analysis message.
+    - v2.3: Added -AdhocSQL parameter and 'Adhoc' parameter set to allow for direct T-SQL string analysis. Refactored input handling.
     Powershell Version: 5.1+
 #>
 [CmdletBinding(DefaultParameterSetName = 'Interactive')]
@@ -57,11 +76,23 @@ param (
     [Parameter(Mandatory=$true, ParameterSetName='Folder')]
     [string]$FolderPath,
 
+    [Parameter(Mandatory=$true, ParameterSetName='Adhoc')]
+    [string]$AdhocSQL,
+
+    [Parameter(Mandatory=$false)]
+    [string]$ServerName,
+
     [Parameter(Mandatory=$false)]
     [switch]$UseActualPlan,
-    
+
+    [Parameter(Mandatory=$false)]
+    [switch]$OpenTunedFile,
+
     [Parameter(Mandatory=$false)]
     [switch]$ResetConfiguration,
+
+    [Parameter(Mandatory=$false)]
+    [int]$UiLogPort,
 
     [Parameter(Mandatory=$false)]
     [switch]$DebugMode
@@ -89,8 +120,22 @@ function Write-Log {
             Write-Warning "CRITICAL: Failed to write to log file $($script:LogFilePath): $($_.Exception.Message)"
         }
     }
+    
+    # 2. If running in UI mode, send the log message over UDP.
+    if ($script:UdpClient) {
+        try {
+            $logString = "$Level|$Message"
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($logString)
+            $script:UdpClient.Send($bytes, $bytes.Length, $script:UdpEndpoint) | Out-Null
+        }
+        catch {
+            # Non-critical error. Write to host console only.
+            Write-Warning "Failed to send log message to UI: $($_.Exception.Message)"
+        }
+    }
 
-    # 2. Handle all console output.
+
+    # 3. Handle all console output.
     # For DEBUG level, only write to console if DebugMode switch is present.
     if ($Level -eq 'DEBUG' -and -not $DebugMode) {
         return
@@ -128,8 +173,9 @@ function Reset-OptimusConfiguration {
     }
 
     Write-Log -Message "`n--- Optimus Configuration Reset ---" -Level 'WARN'
-    Write-Log -Message "[1] Reset Configuration Only (deletes API key and server list)" -Level 'PROMPT'
-    Write-Log -Message "[2] Full Reset (deletes configuration AND all past analysis reports)" -Level 'PROMPT'
+    Write-Log -Message "[1] Reset Configuration Only (deletes API key, server list, and model selection)" -Level 'PROMPT'
+    Write-Log -Message "[2] Remove all Analysis Reports" -Level 'PROMPT'
+    Write-Log -Message "[3] Full Reset (deletes configuration AND all past analysis reports)" -Level 'PROMPT'
     Write-Log -Message "[Q] Quit / Cancel" -Level 'PROMPT'
 
     Write-Log -Message "Enter your choice: " -Level 'PROMPT' -NoNewLine
@@ -139,7 +185,7 @@ function Reset-OptimusConfiguration {
 
     switch ($choice) {
         '1' {
-            Write-Log -Message "Are you sure you want to delete the API key and server list? (Y/N): " -Level 'PROMPT' -NoNewLine
+            Write-Log -Message "Are you sure you want to delete the API key, server list, and model selection? (Y/N): " -Level 'PROMPT' -NoNewLine
             $confirm = Read-Host
             Write-Host ""
             Write-Log -Message "User Input: $confirm" -Level 'DEBUG'
@@ -148,9 +194,11 @@ function Reset-OptimusConfiguration {
                     $serverFile = Join-Path -Path $configDir -ChildPath "servers.json"
                     $apiKeyFile = Join-Path -Path $configDir -ChildPath "api.config"
                     $lastPathFile = Join-Path -Path $configDir -ChildPath "lastpath.config"
+                    $modelFile = Join-Path -Path $configDir -ChildPath "model.config"
                     if (Test-Path $serverFile) { Remove-Item -Path $serverFile -Force; Write-Log -Message "Server list deleted." -Level 'DEBUG' }
                     if (Test-Path $apiKeyFile) { Remove-Item -Path $apiKeyFile -Force; Write-Log -Message "API Key deleted." -Level 'DEBUG' }
                     if (Test-Path $lastPathFile) { Remove-Item -Path $lastPathFile -Force; Write-Log -Message "Last path config deleted." -Level 'DEBUG' }
+                    if (Test-Path $modelFile) { Remove-Item -Path $modelFile -Force; Write-Log -Message "Model configuration deleted." -Level 'DEBUG' }
                     Write-Log -Message "Configuration reset successfully." -Level 'SUCCESS'
                     return $true
                 } catch {
@@ -162,6 +210,29 @@ function Reset-OptimusConfiguration {
             }
         }
         '2' {
+            Write-Log -Message "Are you sure you want to delete ALL past analysis reports? This action cannot be undone. (Y/N): " -Level 'PROMPT' -NoNewLine
+            $confirm = Read-Host
+            Write-Host ""
+            Write-Log -Message "User Input: $confirm" -Level 'DEBUG'
+            if ($confirm -match '^[Yy]$') {
+                try {
+                    $analysisDir = Join-Path -Path $configDir -ChildPath "Analysis"
+                    if (Test-Path $analysisDir) {
+                        Remove-Item -Path $analysisDir -Recurse -Force
+                        Write-Log -Message "All analysis reports have been deleted." -Level 'SUCCESS'
+                    } else {
+                        Write-Log -Message "Analysis reports directory not found. Nothing to delete." -Level 'INFO'
+                    }
+                    return $true
+                } catch {
+                    Write-Log -Message "Failed to remove the analysis reports directory: $($_.Exception.Message)" -Level 'ERROR'
+                    return $false
+                }
+            } else {
+                return $false
+            }
+        }
+        '3' {
             Write-Log -Message "WARNING: This will delete ALL configuration AND all saved analysis reports. This action cannot be undone. Are you absolutely sure? (Y/N): " -Level 'PROMPT' -NoNewLine
             $confirm = Read-Host
             Write-Host ""
@@ -191,10 +262,11 @@ function Initialize-Configuration {
     try {
         $userProfile = $env:USERPROFILE
         $configDir = Join-Path -Path $userProfile -ChildPath ".optimus"
-        $analysisBaseDir = Join-Path -Path $configDir -ChildPath "Analyses"
+        $analysisBaseDir = Join-Path -Path $configDir -ChildPath "Analysis"
         $serverFile = Join-Path -Path $configDir -ChildPath "servers.json"
         $apiKeyFile = Join-Path -Path $configDir -ChildPath "api.config"
         $lastPathFile = Join-Path -Path $configDir -ChildPath "lastpath.config"
+        $modelFile = Join-Path -Path $configDir -ChildPath "model.config"
 
         foreach($dir in @($configDir, $analysisBaseDir)){ if (-not (Test-Path -Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null } }
         if (-not (Test-Path -Path $serverFile)) { Set-Content -Path $serverFile -Value "[]" | Out-Null }
@@ -204,6 +276,7 @@ function Initialize-Configuration {
             ServerFile      = $serverFile
             ApiKeyFile      = $apiKeyFile
             LastPathFile    = $lastPathFile
+            ModelFile       = $modelFile
         }
         Write-Log -Message "Configuration initialized successfully." -Level 'DEBUG'
         return $true
@@ -257,9 +330,84 @@ function Get-And-Set-ApiKey {
         }
     }
 }
+
+function Get-And-Set-Model {
+    Write-Log -Message "Entering Function: Get-And-Set-Model" -Level 'DEBUG'
+    $modelFile = $script:OptimusConfig.ModelFile
+
+    if (Test-Path -Path $modelFile) {
+        $modelName = Get-Content -Path $modelFile -ErrorAction SilentlyContinue
+        if (-not [string]::IsNullOrWhiteSpace($modelName)) {
+            Write-Log -Message "Using configured model: '$modelName'" -Level 'DEBUG'
+            return $modelName
+        }
+    }
+
+    Write-Log -Message "`nPlease select the Gemini model to use for all future analyses:" -Level 'INFO'
+    Write-Log -Message "This can be changed later using the -ResetConfiguration parameter." -Level 'INFO'
+    Write-Log -Message "   [1] Gemini 1.5 Flash (Fastest, good for general use - Default)" -Level 'PROMPT'
+    Write-Log -Message "   [2] Gemini 1.5 Pro (Most powerful, for complex analysis)" -Level 'PROMPT'
+    
+    $modelChoice = $null
+    while (-not $modelChoice) {
+        Write-Log -Message "   Enter your choice: " -Level 'PROMPT' -NoNewLine
+        $choice = Read-Host
+        Write-Host ""
+        Write-Log -Message "User Input: $choice" -Level 'DEBUG'
+        switch ($choice) {
+            '1' { $modelChoice = 'gemini-1.5-flash-latest' }
+            '2' { $modelChoice = 'gemini-1.5-pro' }
+            default { Write-Log -Message "Invalid selection. Please enter 1 or 2." -Level 'ERROR' }
+        }
+    }
+
+    try {
+        Set-Content -Path $modelFile -Value $modelChoice
+        Write-Log -Message "Model set to '$modelChoice'. This will be used for all future runs." -Level 'SUCCESS'
+        return $modelChoice
+    } catch {
+        Write-Log -Message "Failed to save model configuration: $($_.Exception.Message)" -Level 'ERROR'
+        return $null
+    }
+}
 #endregion
 
 #region Environment & Prerequisite Checks
+function Invoke-OptimusVersionCheck {
+    param(
+        [string]$CurrentVersion
+    )
+    Write-Log -Message "Entering Function: Invoke-OptimusVersionCheck" -Level 'DEBUG'
+    
+    try {
+        # The URL for the raw script file on GitHub
+        $repoUrl = "https://raw.githubusercontent.com/BrennanWebb/powershell/main/Production/Optimus.ps1"
+        Write-Log -Message "Checking for new version at: $repoUrl" -Level 'DEBUG'
+
+        # Download the latest script content as a string
+        $webContent = Invoke-WebRequest -Uri $repoUrl -UseBasicParsing -TimeoutSec 10 | Select-Object -ExpandProperty Content
+
+        # Use regex to find the version number in the script's header
+        if ($webContent -match "Version:\s*([\d.]+)") {
+            $latestVersionStr = $matches[1]
+            Write-Log -Message "Latest version found online: '$latestVersionStr'" -Level 'DEBUG'
+            
+            # Compare the versions
+            if ([System.Version]$latestVersionStr -gt [System.Version]$CurrentVersion) {
+                Write-Log -Message "A new version of Optimus is available! (Current: v$CurrentVersion, Latest: v$latestVersionStr)" -Level 'WARN'
+                Write-Log -Message "You can download it from: https://github.com/BrennanWebb/powershell/blob/main/Production/Optimus.ps1" -Level 'WARN'
+            } else {
+                Write-Log -Message "Optimus is up to date." -Level 'DEBUG'
+            }
+        }
+    }
+    catch {
+        # Fail silently if the check doesn't work. This is a non-essential feature.
+        Write-Log -Message "Could not check for a new version. This can happen if GitHub is unreachable or there is no internet connection." -Level 'DEBUG'
+        Write-Log -Message "Version check error: $($_.Exception.Message)" -Level 'DEBUG'
+    }
+}
+
 function Test-PowerShellVersion {
     Write-Log -Message "Entering Function: Test-PowerShellVersion" -Level 'DEBUG'
     $currentVersion = $PSVersionTable.PSVersion
@@ -439,6 +587,14 @@ function Show-FilePicker {
         $fileDialog.Filter = "SQL Files (*.sql)|*.sql|All files (*.*)|*.*"
         $fileDialog.Multiselect = $true
         if ($fileDialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { 
+            # Save the directory of the selected file(s) for next time
+            try {
+                $directory = [System.IO.Path]::GetDirectoryName($fileDialog.FileNames[0])
+                Set-Content -Path $script:OptimusConfig.LastPathFile -Value $directory
+                Write-Log -Message "Saved last used directory: $directory" -Level 'DEBUG'
+            } catch {
+                Write-Log -Message "Could not save the last used directory path." -Level 'WARN'
+            }
             return $fileDialog.FileNames 
         }
     }
@@ -446,46 +602,78 @@ function Show-FilePicker {
     return $null
 }
 
-function Get-SQLQueryFile {
-    Write-Log -Message "Entering Function: Get-SQLQueryFile" -Level 'DEBUG'
+function Get-AnalysisInputs {
+    Write-Log -Message "Entering Function: Get-AnalysisInputs" -Level 'DEBUG'
     Write-Log -Message "Parameter Set Name: $($PSCmdlet.ParameterSetName)" -Level 'DEBUG'
     
-    [string[]]$filesToAnalyze = @()
+    $inputObjects = [System.Collections.Generic.List[object]]::new()
 
     switch ($PSCmdlet.ParameterSetName) {
+        'Adhoc' {
+            if (-not [string]::IsNullOrWhiteSpace($AdhocSQL)) {
+                $baseName = "AdhocQuery_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+                $inputObjects.Add([pscustomobject]@{
+                    SqlText  = $AdhocSQL
+                    BaseName = $baseName
+                })
+                Write-Log -Message "Received Ad-hoc SQL for analysis." -Level 'SUCCESS'
+            } else {
+                Write-Log -Message "The -AdhocSQL parameter was used but contained no query." -Level 'WARN'
+                return $null
+            }
+        }
         'Folder' {
             if (-not (Test-Path -Path $FolderPath -PathType Container)) {
                 Write-Log -Message "The path provided for -FolderPath is not a valid directory: '$FolderPath'." -Level 'ERROR'
                 return $null
             }
-            # Non-recursive search as requested
             $filesToAnalyze = (Get-ChildItem -Path $FolderPath -Filter *.sql).FullName
             if ($filesToAnalyze.Count -eq 0) {
                 Write-Log -Message "No .sql files were found in the specified folder: '$FolderPath'." -Level 'WARN'
                 return $null
             }
             Write-Log -Message "Found $($filesToAnalyze.Count) file(s) in folder '$FolderPath' for analysis." -Level 'SUCCESS'
+            foreach ($file in $filesToAnalyze) {
+                $inputObjects.Add([pscustomobject]@{
+                    SqlText  = Get-Content -Path $file -Raw
+                    BaseName = [System.IO.Path]::GetFileNameWithoutExtension($file)
+                })
+            }
         }
         'Files' {
+            [string[]]$validFiles = @()
             foreach ($file in $SQLFile) {
                 if ((Test-Path -Path $file -PathType Leaf) -and $file -like '*.sql') {
-                    $filesToAnalyze += $file
+                    $validFiles += $file
                 } else {
                     Write-Log -Message "Parameter invalid, file not found or not a .sql file: '$file'. Skipping." -Level 'WARN'
                 }
             }
-            if ($filesToAnalyze.Count -eq 0) {
+            if ($validFiles.Count -eq 0) {
                  Write-Log -Message "No valid .sql files were provided via the -SQLFile parameter." -Level 'WARN'
                  return $null
             }
+            Write-Log -Message "Successfully targeted $($validFiles.Count) file(s) for analysis." -Level 'SUCCESS'
+            foreach ($file in $validFiles) {
+                $inputObjects.Add([pscustomobject]@{
+                    SqlText  = Get-Content -Path $file -Raw
+                    BaseName = [System.IO.Path]::GetFileNameWithoutExtension($file)
+                })
+            }
         }
         default { # Interactive Mode
-            while ($filesToAnalyze.Count -eq 0) {
+            while ($inputObjects.Count -eq 0) {
                 Write-Log -Message "`nPlease select one or more .sql files to analyze..." -Level 'INFO'
                 $selectedFiles = Show-FilePicker
                 
                 if ($null -ne $selectedFiles -and $selectedFiles.Count -gt 0) {
-                    $filesToAnalyze = $selectedFiles
+                     Write-Log -Message "Successfully selected $($selectedFiles.Count) file(s) for analysis." -Level 'SUCCESS'
+                     foreach ($file in $selectedFiles) {
+                        $inputObjects.Add([pscustomobject]@{
+                            SqlText  = Get-Content -Path $file -Raw
+                            BaseName = [System.IO.Path]::GetFileNameWithoutExtension($file)
+                        })
+                    }
                 } else {
                     Write-Log -Message "   File selection cancelled. Try again? (Y/N): " -Level 'PROMPT' -NoNewLine
                     $retry = Read-Host
@@ -497,20 +685,7 @@ function Get-SQLQueryFile {
         }
     }
 
-    if ($filesToAnalyze.Count -gt 0) {
-        try {
-            $directory = [System.IO.Path]::GetDirectoryName($filesToAnalyze[0])
-            Set-Content -Path $script:OptimusConfig.LastPathFile -Value $directory
-            Write-Log -Message "Saved last used directory: $directory" -Level 'DEBUG'
-        } catch {
-            Write-Log -Message "Could not save the last used directory path." -Level 'WARN'
-        }
-        if ($PSCmdlet.ParameterSetName -ne 'Folder') {
-             Write-Log -Message "Successfully selected $($filesToAnalyze.Count) file(s) for analysis." -Level 'SUCCESS'
-        }
-    }
-
-    return $filesToAnalyze
+    return $inputObjects
 }
 #endregion
 
@@ -527,45 +702,42 @@ function Get-MasterExecutionPlan {
     $dbContextForCheck = if ([string]::IsNullOrWhiteSpace($DatabaseContext)) { 'master' } else { $DatabaseContext }
     Write-Log -Message "Using database context '$dbContextForCheck' to generate plan." -Level 'DEBUG'
 
-    # Clean the input query to prevent issues with trailing GOs
     $cleanQueryText = $FullQueryText.Trim()
     if ($cleanQueryText.ToUpper().EndsWith('GO')) {
         $cleanQueryText = $cleanQueryText.Substring(0, $cleanQueryText.Length - 2).Trim()
     }
     
+    # Log the exact query text being sent to the log file for debugging and auditing.
+    Write-Log -Message "Cleaned T-SQL for execution plan generation:`n$cleanQueryText" -Level 'DEBUG'
+
     $planQuery = "$planCommand`nGO`n$cleanQueryText"
     try {
         $planResult = Invoke-Sqlcmd -ServerInstance $ServerInstance -Database $dbContextForCheck -TrustServerCertificate -Query $planQuery -MaxCharLength ([int]::MaxValue) -ErrorAction Stop
         
-        $xmlPlanString = $null
-        $resultSets = @($planResult)
-        
-        # In a multi-batch script, we iterate backwards and take the FIRST valid plan we find,
-        # which corresponds to the LAST actual query batch in the script.
-        for ($i = $resultSets.Count - 1; $i -ge 0; $i--) {
-            $resultSet = $resultSets[$i]
+        $planFragments = @()
+        foreach ($resultSet in $planResult) {
             if ($resultSet) {
                 $potentialPlan = $resultSet.Item(0)
-                # Check for a non-trivial plan to avoid empty plans from USE statements
-                if ($potentialPlan -is [string] -and $potentialPlan -like '<*showplan*>' -and $potentialPlan.Length -gt 500) { 
-                    $xmlPlanString = $potentialPlan
-                    break
+                if ($potentialPlan -is [string] -and $potentialPlan -like '<*showplan*>') {
+                    $planFragments += $potentialPlan
                 }
             }
         }
         
-        if (-not $xmlPlanString) {
+        if ($planFragments.Count -eq 0) {
             Write-Log -Message "Could not find a valid execution plan string in the results from SQL Server." -Level 'ERROR'
-            Write-Log -Message "The SQL script might be producing result sets that are interfering with plan capture." -Level 'DEBUG'
             return $null
         }
 
+        # Combine all found plan fragments into a single master XML document
+        $masterPlanXml = "<MasterShowPlan>" + ($planFragments -join '') + "</MasterShowPlan>"
+        
         try {
-            [xml]$xmlPlanString | Out-Null
-            Write-Log -Message "Successfully generated and validated master execution plan." -Level 'SUCCESS'
-            return $xmlPlanString
+            [xml]$masterPlanXml | Out-Null
+            Write-Log -Message "Successfully generated and validated master execution plan for all statements." -Level 'SUCCESS'
+            return $masterPlanXml
         } catch {
-            Write-Log -Message "The execution plan string returned by SQL Server is not valid XML. Error: $($_.Exception.Message)" -Level 'ERROR'
+            Write-Log -Message "The combined execution plan string is not valid XML. Error: $($_.Exception.Message)" -Level 'ERROR'
             return $null
         }
     }
@@ -582,28 +754,16 @@ function Get-ObjectsFromPlan {
     try {
         $objectNodes = $MasterPlan.SelectNodes("//sql:Object", $NamespaceManager)
         $uniqueObjectNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-        $skippedSystemObjectCount = 0
 
         foreach($node in $objectNodes) {
             $db = $node.GetAttribute("Database")
             $schema = $node.GetAttribute("Schema")
             $table = $node.GetAttribute("Table")
             
-            # We only care about nodes that are fully qualified and not temp tables
             if ($table -notlike "#*" -and -not ([string]::IsNullOrWhiteSpace($db)) -and -not ([string]::IsNullOrWhiteSpace($schema))) {
-                # Check if the object belongs to the 'sys' schema and skip it if so
-                if ($schema -eq '[sys]' -or $schema -eq 'sys') {
-                    $skippedSystemObjectCount++
-                } else {
-                    $fullName = "$db.$schema.$table".Replace('[','').Replace(']','')
-                    $uniqueObjectNames.Add($fullName) | Out-Null
-                }
+                $fullName = "$db.$schema.$table".Replace('[','').Replace(']','')
+                $uniqueObjectNames.Add($fullName) | Out-Null
             }
-        }
-        
-        # If any system objects were found and skipped, notify the user.
-        if ($skippedSystemObjectCount -gt 0) {
-            Write-Log -Message "Note: Skipped analysis of $skippedSystemObjectCount internal system object(s) to focus on user code." -Level 'INFO'
         }
 
         $finalList = $uniqueObjectNames | Sort-Object
@@ -621,7 +781,7 @@ function Get-ObjectsFromPlan {
             Write-Log -Message "The following unique user objects were found in the execution plan:`n$tableOutput" -Level 'DEBUG'
         }
 
-        Write-Log -Message "Identified $($finalList.Count) unique user objects for schema collection." -Level 'SUCCESS'
+        Write-Log -Message "Identified $($finalList.Count) unique objects for schema collection." -Level 'SUCCESS'
         Write-Log -Message "Returning from Get-ObjectsFromPlan." -Level 'DEBUG'
         return $finalList
     } catch {
@@ -641,45 +801,55 @@ function Get-ObjectSchema {
     
     $fullObjectName = "[$SchemaName].[$ObjectName]"
     $schemaText = "--- Schema For Table: $SchemaName.$ObjectName ---`n"
-    $errorState = $false
+    $columnResult = $null
 
-    # Get Column Info
+    # Get Column Info - Primary Method
     try {
         $columnQuery = "SELECT name, system_type_name, max_length, [precision], scale, is_nullable FROM sys.dm_exec_describe_first_result_set(N'SELECT * FROM $fullObjectName', NULL, 0);"
         $columnResult = Invoke-Sqlcmd -ServerInstance $ServerInstance -Database $DatabaseName -TrustServerCertificate -Query $columnQuery -ErrorAction Stop
-        if ($columnResult -and $columnResult.Count -gt 0) {
-            $schemaText += "COLUMNS:`n"
-            foreach($col in $columnResult) {
-                $isNullable = if ($col.is_nullable) { 'YES' } else { 'NO' }
-                $schemaText += "name: $($col.name), type: $($col.system_type_name), length: $($col.max_length), nullable: $isNullable`n"
-            }
+    } catch {
+        Write-Log -Message "Primary schema collection method failed for '$fullObjectName'. Attempting fallback." -Level 'DEBUG'
+        # Fallback Method
+        try {
+            $fallbackQuery = @"
+SELECT c.name, t.name AS system_type_name, c.max_length, c.precision, c.scale, c.is_nullable
+FROM sys.columns c JOIN sys.types t ON c.user_type_id = t.user_type_id
+WHERE c.object_id = OBJECT_ID(@FullObjectName) ORDER BY c.column_id;
+"@
+            $params = @{ FullObjectName = "$DatabaseName.$fullObjectName" }
+            $columnResult = Invoke-Sqlcmd -ServerInstance $ServerInstance -Database $DatabaseName -TrustServerCertificate -Query $fallbackQuery -Variable $params -ErrorAction Stop
+        } catch {
+            Write-Log -Message "Could not get COLUMN schema for '$fullObjectName' in db '$DatabaseName' using any method. Error: $($_.Exception.Message)" -Level 'WARN'
         }
-    } catch { 
-        $warning = "Could not get COLUMN schema for '$fullObjectName' in db '$DatabaseName'."
-        Write-Log -Message $warning -Level 'WARN'; $errorState = $true
+    }
+
+    if ($columnResult) {
+        $schemaText += "COLUMNS:`n"
+        foreach($col in $columnResult) {
+            $isNullable = if ($col.is_nullable) { 'YES' } else { 'NO' }
+            $schemaText += "name: $($col.name), type: $($col.system_type_name), length: $($col.max_length), nullable: $isNullable`n"
+        }
     }
 
     # Get Index Info
-    if (-not $errorState) {
-        try {
-            $indexQuery = @"
+    try {
+        $indexQuery = @"
 SELECT i.name AS IndexName, i.type_desc AS IndexType,
 STUFF((SELECT ', ' + c.name FROM sys.index_columns ic JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 0 ORDER BY ic.key_ordinal FOR XML PATH('')), 1, 2, '') AS KeyColumns,
 STUFF((SELECT ', ' + c.name FROM sys.index_columns ic JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 1 ORDER BY ic.key_ordinal FOR XML PATH('')), 1, 2, '') AS IncludedColumns
 FROM sys.indexes i WHERE i.object_id = OBJECT_ID('$fullObjectName');
 "@
-            $indexResult = Invoke-Sqlcmd -ServerInstance $ServerInstance -Database $DatabaseName -TrustServerCertificate -Query $indexQuery -ErrorAction Stop
-            if ($indexResult -and $indexResult.Count -gt 0) {
-                $schemaText += "`nINDEXES:`n"
-                foreach($idx in $indexResult) {
-                    $idxLine = "IndexName: $($idx.IndexName), Type: $($idx.IndexType), KeyColumns: $($idx.KeyColumns)"
-                    if (-not [string]::IsNullOrWhiteSpace($idx.IncludedColumns)) { $idxLine += ", IncludedColumns: $($idx.IncludedColumns)" }
-                    $schemaText += $idxLine + "`n"
-                }
+        $indexResult = Invoke-Sqlcmd -ServerInstance $ServerInstance -Database $DatabaseName -TrustServerCertificate -Query $indexQuery -ErrorAction Stop
+        if ($indexResult -and $indexResult.Count -gt 0) {
+            $schemaText += "`nINDEXES:`n"
+            foreach($idx in $indexResult) {
+                $idxLine = "IndexName: $($idx.IndexName), Type: $($idx.IndexType), KeyColumns: $($idx.KeyColumns)"
+                if (-not [string]::IsNullOrWhiteSpace($idx.IncludedColumns)) { $idxLine += ", IncludedColumns: $($idx.IncludedColumns)" }
+                $schemaText += $idxLine + "`n"
             }
-        } catch {
-            Write-Log -Message "Could not get INDEX information for '$fullObjectName'." -Level 'WARN'
         }
+    } catch {
+        Write-Log -Message "Could not get INDEX information for '$fullObjectName'." -Level 'WARN'
     }
     
     return $schemaText + "`n"
@@ -687,6 +857,7 @@ FROM sys.indexes i WHERE i.object_id = OBJECT_ID('$fullObjectName');
 
 function Invoke-GeminiAnalysis {
     param(
+        [string]$ModelName,
         [securestring]$ApiKey, 
         [string]$FullSqlText, 
         [string]$ConsolidatedSchema, 
@@ -694,14 +865,17 @@ function Invoke-GeminiAnalysis {
         [string]$SqlServerVersion
     )
     Write-Log -Message "Entering Function: Invoke-GeminiAnalysis" -Level 'DEBUG'
-    Write-Log -Message "Sending full script to Gemini for holistic analysis..." -Level 'INFO'
+    Write-Log -Message "Sending full script to Gemini for analysis..." -Level 'INFO'
 
     $plainTextApiKey = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto([System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($ApiKey))
-    $uri = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=$plainTextApiKey"
+    $uri = "https://generativelanguage.googleapis.com/v1beta/models/$($ModelName):generateContent?key=$plainTextApiKey"
 
     # --- Start of Modified Prompt ---
     $prompt = @"
 You are an expert T-SQL performance tuning assistant. You will be provided with the specific SQL Server version. You MUST ensure that any T-SQL syntax you generate is valid for that version.
+
+Your Core Mandate:
+Your ONLY task is to return the complete, original T-SQL script provided below. You will add T-SQL comment blocks containing your analysis directly above any statements you identify for improvement. Think of this as a text transformation task: the original text is your input, and the identical text with your added comments is the only output.
 
 Your Golden Rule:
 You MUST NOT change the original T-SQL code. The final output must contain the original, unmodified T-SQL script with only your comments added.
@@ -717,29 +891,35 @@ You should consider the following categories of recommendations. For any given T
     * **Create New Index:** If no existing index is a suitable candidate for alteration, recommend a new, covering index. Provide the complete `CREATE INDEX` DDL.
 
 Comment Formatting:
-Every analysis comment block you add MUST use the following structure. The block starts with a general "Optimus Analysis" header. Inside, each distinct recommendation is numbered and contains the three required sections. This allows for multiple, independent suggestions for the same statement.
+Every analysis comment block you add MUST use the following structure. The block starts with a general "Optimus Analysis" header. Inside, each distinct recommendation is numbered and contains the three required sections. This allows for multiple, independent suggestions for the same statement. Important: All text inside the comment block must be plain text. Do not use any Markdown formatting like **bolding** or `backticks`.
 
 /*
 --- Optimus Analysis ---
 
 [1] Recommendation
     - Problem: A brief, clear explanation of the first performance issue.
-    - Recommended Code: The suggested T-SQL query rewrite or DDL syntax for the first issue.
-    - Reasoning: An explanation of why this specific recommendation improves performance.
 
+    - Recommended Code: The suggested T-SQL query rewrite or DDL syntax for the first issue.
+
+    - Reasoning: An explanation of why this specific recommendation improves performance.
+    
+    
 [2] Recommendation
     - Problem: A brief, clear explanation of a second, distinct performance issue.
+
     - Recommended Code: The alternative or additional code for the second recommendation.
+
     - Reasoning: An explanation of why this second recommendation is also a valid performance improvement.
+
 
 (Add more numbered recommendations as needed for the same statement)
 */
 
 Final Output Rules:
-- Your entire response must be ONLY the T-SQL script text.
-- If you add comments, they must be placed directly above the relevant statement in the original script using the format specified above.
-- If the entire script is already optimal and you have no comments to add, return only the original, unmodified T-SQL script text.
-- Do not include any conversational text, greetings, or explanations outside of the T-SQL comments.
+- Your response MUST be the complete, original T-SQL script from start to finish. Do not omit any part of the original script for any reason.
+- For statements that require improvement, insert your formatted analysis comment block directly above the statement.
+- For statements that are already optimal, include the original T-SQL for that statement without any comment.
+- Your entire response must be ONLY the T-SQL script text. Do not include any conversational text, greetings, or explanations outside of the T-SQL comments.
 
 --- SQL SERVER VERSION ---
 $SqlServerVersion
@@ -838,175 +1018,284 @@ Timestamp: $(Get-Date)
 
 # --- Main Application Logic ---
 function Start-Optimus {
-    if ($DebugMode) { Write-Log -Message "Starting Optimus v1.0-preview in Debug Mode." -Level 'DEBUG'}
-
-    # Group prerequisite checks
-    $checksPassed = {
-        if (-not (Test-WindowsEnvironment)) { return $false }
-        if (-not (Test-PowerShellVersion)) { return $false }
-        if ($ResetConfiguration) {
-            if (-not (Reset-OptimusConfiguration)) {
-                Write-Log -Message "Reset cancelled by user. Exiting script." -Level 'WARN'
-                return $false
-            }
-        }
-        if (-not (Initialize-Configuration)) { return $false }
-        if (-not (Test-InternetConnection)) {
-            Write-Log -Message "Exiting due to no internet connection or user choice." -Level 'ERROR'
-            return $false
-        }
-        if (-not (Test-SqlServerModule)) { return $false }
-        if (-not (Get-And-Set-ApiKey)) {
-            Write-Log -Message "Exiting due to missing API key." -Level 'ERROR'
-            return $false
-        }
-        return $true
-    }.Invoke()
-
-    if (-not $checksPassed) { return }
-
-    Write-Log -Message "`n--- Welcome to Optimus v1.0-preview ---" -Level 'SUCCESS'
-    if (-not $DebugMode) { Write-Log -Message "All prerequisite checks passed." -Level 'SUCCESS' }
+    # Define the current version of the script in one place.
+    $script:CurrentVersion = "2.8.0"
+    $script:UdpClient = $null
+    $script:UdpEndpoint = $null
     
-    do { # Outer loop to allow running multiple batches
-        $script:AnalysisPath = $null 
-        $script:LogFilePath = $null
-
-        $selectedServer = Select-SqlServer; if (-not $selectedServer) { Write-Log -Message "No server selected." -Level 'WARN'; break }
-        
-        [string[]]$sqlFilePaths = Get-SQLQueryFile
-        if ($null -eq $sqlFilePaths -or $sqlFilePaths.Count -eq 0) {
-            Write-Log -Message "No files were selected for analysis." -Level 'WARN'
-            continue
-        }
-
-        # Select Plan Type once for the entire batch
-        $useActualPlanSwitch = $UseActualPlan.IsPresent
-        if (-not $UseActualPlan.IsPresent -and -not $ResetConfiguration) {
-            Write-Log -Message "`nWhich execution plan would you like to generate for this batch?" -Level 'INFO'
-            Write-Log -Message "   [1] Estimated (Default - Recommended, does not run the query)" -Level 'PROMPT'
-            Write-Log -Message "   [2] Actual (Executes the query, use with caution on all files)" -Level 'PROMPT'
-            Write-Log -Message "   Enter your choice: " -Level 'PROMPT' -NoNewLine
-            $choice = Read-Host
-            Write-Host ""
-            Write-Log -Message "User Input: $choice" -Level 'DEBUG'
-            if ($choice -eq '2') {
-                Write-Log -Message "Proceeding with 'Actual Execution Plan'. This will EXECUTE every SQL script in the batch." -Level 'WARN'
-                $useActualPlanSwitch = $true
-            }
-        }
-
-        # Create the single parent batch folder
-        $batchTimestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-        $batchFolderPath = Join-Path -Path $script:OptimusConfig.AnalysisBaseDir -ChildPath $batchTimestamp
-        New-Item -Path $batchFolderPath -ItemType Directory -Force | Out-Null
-        Write-Log -Message "`nCreated batch analysis folder: $batchFolderPath" -Level 'SUCCESS'
-
-        # Loop through each selected file
-        foreach ($sqlFilePath in $sqlFilePaths) {
+    # Use a finally block to ensure cleanup happens
+    try {
+        # --- UI Mode Setup ---
+        if ($PSBoundParameters.ContainsKey('UiLogPort')) {
             try {
-                $fileNameOnly = [System.IO.Path]::GetFileName($sqlFilePath)
-                Write-Log -Message "`n--- Starting Analysis for: $fileNameOnly ---" -Level 'SUCCESS'
-
-                # Create a sub-folder for this specific file's analysis
-                $baseName = [System.IO.Path]::GetFileNameWithoutExtension($sqlFilePath)
-                $script:AnalysisPath = Join-Path -Path $batchFolderPath -ChildPath $baseName
-                New-Item -Path $script:AnalysisPath -ItemType Directory -Force | Out-Null
-
-                # Set up the log file path for this specific analysis
-                $script:LogFilePath = Join-Path -Path $script:AnalysisPath -ChildPath "ExecutionLog.txt"
-                "# Optimus v1.0-preview Execution Log | File: $fileNameOnly | Started: $(Get-Date)" | Out-File -FilePath $script:LogFilePath -Encoding utf8
-                
-                Write-Log -Message "Created analysis directory: '$($script:AnalysisPath)'" -Level 'INFO'
-                $sqlVersion = Get-SqlServerVersion -ServerInstance $selectedServer
-                Write-Log -Message "Detected SQL Server Version: $sqlVersion" -Level 'DEBUG'
-                
-                $sqlQueryText = Get-Content -Path $sqlFilePath -Raw
-            
-                # 1. Get Master Plan. Use a default context but the plan will have fully-qualified names.
-                $initialDbContext = ([regex]::Match($sqlQueryText, '(?im)^\s*USE\s+\[?([\w\d_]+)\]?')).Groups[1].Value
-                if ([string]::IsNullOrWhiteSpace($initialDbContext)) { $initialDbContext = 'master' }
-                $masterPlanXml = Get-MasterExecutionPlan -ServerInstance $selectedServer -DatabaseContext $initialDbContext -FullQueryText $sqlQueryText -IsActualPlan:$useActualPlanSwitch
-                if (-not $masterPlanXml) { 
-                    Write-Log -Message "Could not generate a master plan for $fileNameOnly. Skipping to next file." -Level 'ERROR'
-                    continue 
-                }
-                
-                $planPath = Join-Path -Path $script:AnalysisPath -ChildPath "_MasterPlan.xml"
-                try { $masterPlanXml | Set-Content -Path $planPath -Encoding UTF8; Write-Log -Message "Master execution plan saved." -Level 'DEBUG' } catch { Write-Log -Message "Could not save master plan file." -Level 'WARN' }
-
-                # 2. Parse unique object names from the plan
-                [xml]$masterPlan = $masterPlanXml
-                $ns = New-Object System.Xml.XmlNamespaceManager($masterPlan.NameTable)
-                $ns.AddNamespace("sql", "http://schemas.microsoft.com/sqlserver/2004/07/showplan")
-                [string[]]$uniqueObjectNames = @(Get-ObjectsFromPlan -MasterPlan $masterPlan -NamespaceManager $ns)
-                $statementNodes = $masterPlan.SelectNodes("//sql:StmtSimple", $ns)
-                
-                # 3. Build the consolidated schema document using the robust iterative method
-                $consolidatedSchema = ""
-                if ($null -ne $uniqueObjectNames -and $uniqueObjectNames.Count -gt 0) {
-                    Write-Log -Message "Starting schema collection for all objects..." -Level 'INFO'
-                    $objectsByDb = $uniqueObjectNames | Group-Object { ($_ -split '\.')[0] }
-
-                    foreach ($dbGroup in $objectsByDb) {
-                        $dbName = $dbGroup.Name
-                        Write-Log -Message "Querying database '$dbName'..." -Level 'INFO'
-                        foreach ($objName in $dbGroup.Group) {
-                            $parts = $objName.Split('.')
-                            $consolidatedSchema += Get-ObjectSchema -ServerInstance $selectedServer -DatabaseName $parts[0] -SchemaName $parts[1] -ObjectName $parts[2]
-                        }
-                    }
-                } else {
-                    Write-Log -Message "No user database objects were found in the execution plan for $fileNameOnly. Halting analysis for this file." -Level 'WARN'
-                    continue
-                }
-
-                if ([string]::IsNullOrWhiteSpace($consolidatedSchema)) {
-                     Write-Log -Message "Schema collection resulted in an empty document. This could be due to permissions or missing objects. Halting analysis for this file." -Level 'WARN'
-                     continue
-                }
-
-                $schemaPath = Join-Path -Path $script:AnalysisPath -ChildPath "_ConsolidatedSchema.txt"
-                try { $consolidatedSchema | Set-Content -Path $schemaPath -Encoding UTF8; Write-Log -Message "Consolidated schema saved." -Level 'DEBUG' } catch { Write-Log -Message "Could not save consolidated schema file." -Level 'WARN' }
-
-                # 4. Make single "Omnibus" call to AI
-                $finalScript = Invoke-GeminiAnalysis -ApiKey $script:GeminiApiKey -FullSqlText $sqlQueryText -ConsolidatedSchema $consolidatedschema -MasterPlanXml $masterPlanXml -SqlServerVersion $sqlVersion
-                
-                # 5. Process and save the final result
-                if ($finalScript) {
-                    $finalScript = $finalScript.Trim()
-                    $tunedScriptPath = Join-Path -Path $script:AnalysisPath -ChildPath "${baseName}_tuned.sql"
-                    $finalScript | Out-File -FilePath $tunedScriptPath -Encoding UTF8
-                    New-AnalysisSummary -TunedScript $finalScript -TotalStatementCount $statementNodes.Count -AnalysisPath $script:AnalysisPath
-                    Write-Log -Message "Analysis complete for $fileNameOnly." -Level 'SUCCESS'
-                } else {
-                    Write-Log -Message "Analysis halted for $fileNameOnly due to an error or empty response from the AI." -Level 'ERROR'
-                }
+                $script:UdpClient = New-Object System.Net.Sockets.UdpClient
+                $script:UdpEndpoint = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse("127.0.0.1"), $UiLogPort)
             }
             catch {
-                Write-Log -Message "CRITICAL UNHANDLED ERROR during analysis of '$fileNameOnly': $($_.Exception.Message). Moving to next file." -Level 'ERROR'
-                Write-Log -Message "Stack Trace: $($_.ScriptStackTrace)" -Level 'DEBUG'
+                Write-Warning "Could not initialize UDP client for UI logging: $($_.Exception.Message)"
+                $script:UdpClient = $null # Ensure it's null on failure
             }
-        } # End foreach loop
-
-        Write-Log -Message "`n--- Batch Analysis Complete ---" -Level 'SUCCESS'
-        Write-Log -Message "All analysis folders for this batch are located in:" -Level 'SUCCESS'
-        Write-Log -Message "$batchFolderPath" -Level 'RESULT'
-
-        try {
-            Invoke-Item -Path $batchFolderPath
-            Write-Log -Message "Opening batch folder in File Explorer." -Level 'DEBUG'
-        } catch {
-            Write-Log -Message "Could not automatically open the batch folder. Please navigate to the path above manually." -Level 'WARN'
         }
-        
-        Write-Log -Message "`nWould you like to analyze another batch of files? (Y/N): " -Level 'PROMPT' -NoNewLine
-        $response = Read-Host
-        Write-Host ""
-        Write-Log -Message "User Input: $response" -Level 'DEBUG'
 
-    } while ($response -match '^[Yy]$')
-    Write-Log -Message "Thank you for using Optimus. Exiting." -Level 'SUCCESS'
+        if ($DebugMode) { Write-Log -Message "Starting Optimus v$($script:CurrentVersion) in Debug Mode." -Level 'DEBUG'}
+
+        # Group prerequisite checks
+        $checksPassed = {
+            if (-not (Test-WindowsEnvironment)) { return $false }
+            if (-not (Test-PowerShellVersion)) { return $false }
+            if ($ResetConfiguration) {
+                if (-not (Reset-OptimusConfiguration)) {
+                    Write-Log -Message "Reset cancelled by user. Exiting script." -Level 'WARN'
+                    return $false
+                }
+            }
+            if (-not (Initialize-Configuration)) { return $false }
+            # Skip internet check if in non-interactive mode; assume it's available
+            if ($PSCmdlet.ParameterSetName -eq 'Interactive') {
+                if (-not (Test-InternetConnection)) {
+                    Write-Log -Message "Exiting due to no internet connection or user choice." -Level 'ERROR'
+                    return $false
+                }
+            }
+            
+            Invoke-OptimusVersionCheck -CurrentVersion $script:CurrentVersion
+
+            if (-not (Test-SqlServerModule)) { return $false }
+            if (-not (Get-And-Set-ApiKey)) {
+                Write-Log -Message "Exiting due to missing API key." -Level 'ERROR'
+                return $false
+            }
+            
+            $script:ChosenModel = Get-And-Set-Model
+            if (-not $script:ChosenModel) {
+                Write-Log -Message "Exiting due to no model being selected." -Level 'ERROR'
+                return $false
+            }
+            return $true
+        }.Invoke()
+
+        if (-not $checksPassed) { return }
+
+        Write-Log -Message "`n--- Welcome to Optimus v$($script:CurrentVersion) ---" -Level 'SUCCESS'
+        if (-not $DebugMode) { Write-Log -Message "All prerequisite checks passed." -Level 'SUCCESS' }
+        
+        do { # Outer loop to allow running multiple batches
+            $script:AnalysisPath = $null 
+            $script:LogFilePath = $null
+
+            # Server Selection Logic
+            $selectedServer = $null
+            # If the ServerName parameter is provided, use it.
+            if (-not [string]::IsNullOrWhiteSpace($ServerName)) {
+                Write-Log -Message "ServerName parameter provided, attempting to connect to '$ServerName'." -Level 'INFO'
+                if (Test-SqlServerConnection -ServerInstance $ServerName) {
+                    $selectedServer = $ServerName
+                    # Logic to save the validated server to the config file for future use
+                    try {
+                        [array]$servers = Get-Content -Path $script:OptimusConfig.ServerFile | ConvertFrom-Json
+                        if ($selectedServer -notin $servers) {
+                            $servers += $selectedServer
+                            ($servers | Sort-Object -Unique) | ConvertTo-Json -Depth 5 | Set-Content -Path $script:OptimusConfig.ServerFile
+                            Write-Log -Message "'$selectedServer' has been validated and saved to the configuration." -Level 'DEBUG'
+                        }
+                    } catch {
+                        Write-Log -Message "Could not save the provided server name to the configuration file." -Level 'WARN'
+                    }
+                } else {
+                    # If the connection fails, stop the script.
+                    Write-Log -Message "Connection test to the server '$ServerName' failed. Please check the server name and permissions." -Level 'ERROR'
+                    return # Exit the function/script
+                }
+            } else {
+                # Otherwise, fall back to the interactive menu.
+                $selectedServer = Select-SqlServer
+            }
+
+            # Final check to ensure a server was successfully selected.
+            if (-not $selectedServer) {
+                Write-Log -Message "No valid SQL Server was selected or provided. Halting analysis for this batch." -Level 'WARN'
+                break 
+            }
+            
+            # Get the inputs for analysis (from files, folder, or ad-hoc string)
+            [array]$analysisInputs = Get-AnalysisInputs
+            if ($null -eq $analysisInputs -or $analysisInputs.Count -eq 0) {
+                Write-Log -Message "No valid inputs were found for analysis." -Level 'WARN'
+                continue
+            }
+
+            # Select Plan Type once for the entire batch.
+            $useActualPlanSwitch = $UseActualPlan.IsPresent
+
+            # In interactive mode, if the plan type isn't specified, we must ask the user.
+            # In non-interactive modes ('Files', 'Folder', 'Adhoc'), it defaults to Estimated unless -UseActualPlan is specified.
+            if ($PSCmdlet.ParameterSetName -eq 'Interactive' -and -not $UseActualPlan.IsPresent) {
+                Write-Log -Message "`nWhich execution plan would you like to generate for this batch?" -Level 'INFO'
+                Write-Log -Message "   [1] Estimated (Default - Recommended, does not run the query)" -Level 'PROMPT'
+                Write-Log -Message "   [2] Actual (Executes the query, use with caution on all files)" -Level 'PROMPT'
+                Write-Log -Message "   Enter your choice: " -Level 'PROMPT' -NoNewLine
+                $choice = Read-Host
+                Write-Host ""
+                Write-Log -Message "User Input: $choice" -Level 'DEBUG'
+                if ($choice -eq '2') {
+                    Write-Log -Message "Proceeding with 'Actual Execution Plan'. This will EXECUTE every SQL script in the batch." -Level 'WARN'
+                    $useActualPlanSwitch = $true
+                } else {
+                    Write-Log -Message "Defaulting to 'Estimated Execution Plan' for this batch." -Level 'INFO'
+                }
+            }
+
+            # Create the model-specific and batch parent folders
+            $sanitizedModelName = $script:ChosenModel -replace '[.\s]+', '_'
+            $modelSpecificPath = Join-Path -Path $script:OptimusConfig.AnalysisBaseDir -ChildPath $sanitizedModelName
+
+            # Ensure the model-specific parent directory exists
+            if (-not (Test-Path -Path $modelSpecificPath)) {
+                New-Item -Path $modelSpecificPath -ItemType Directory -Force | Out-Null
+            }
+
+            $batchTimestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+            $batchFolderPath = Join-Path -Path $modelSpecificPath -ChildPath $batchTimestamp
+            New-Item -Path $batchFolderPath -ItemType Directory -Force | Out-Null
+            Write-Log -Message "`nCreated batch analysis folder: $batchFolderPath" -Level 'SUCCESS'
+
+            # Loop through each input object
+            foreach ($input in $analysisInputs) {
+                try {
+                    $baseName = $input.BaseName
+                    $sqlQueryText = $input.SqlText
+
+                    Write-Log -Message "`n--- Starting Analysis for: $baseName ---" -Level 'SUCCESS'
+
+                    # Create a sub-folder for this specific file's analysis
+                    $script:AnalysisPath = Join-Path -Path $batchFolderPath -ChildPath $baseName
+                    New-Item -Path $script:AnalysisPath -ItemType Directory -Force | Out-Null
+
+                    # Set up the log file path for this specific analysis
+                    $script:LogFilePath = Join-Path -Path $script:AnalysisPath -ChildPath "ExecutionLog.txt"
+                    "# Optimus v$($script:CurrentVersion) Execution Log | File: $baseName | Started: $(Get-Date)" | Out-File -FilePath $script:LogFilePath -Encoding utf8
+                    
+                    Write-Log -Message "Created analysis directory: '$($script:AnalysisPath)'" -Level 'INFO'
+                    $sqlVersion = Get-SqlServerVersion -ServerInstance $selectedServer
+                    Write-Log -Message "Detected SQL Server Version: $sqlVersion" -Level 'DEBUG'
+                    
+                    # 1. Get Master Plan. Use a default context but the plan will have fully-qualified names.
+                    $initialDbContext = ([regex]::Match($sqlQueryText, '(?im)^\s*USE\s+\[?([\w\d_]+)\]?')).Groups[1].Value
+                    if ([string]::IsNullOrWhiteSpace($initialDbContext)) { $initialDbContext = 'master' }
+                    $masterPlanXml = Get-MasterExecutionPlan -ServerInstance $selectedServer -DatabaseContext $initialDbContext -FullQueryText $sqlQueryText -IsActualPlan:$useActualPlanSwitch
+                    if (-not $masterPlanXml) { 
+                        Write-Log -Message "Could not generate a master plan for $baseName. Skipping to next item." -Level 'ERROR'
+                        continue 
+                    }
+                    
+                    $planPath = Join-Path -Path $script:AnalysisPath -ChildPath "_MasterPlan.xml"
+                    try { $masterPlanXml | Set-Content -Path $planPath -Encoding UTF8; Write-Log -Message "Master execution plan saved." -Level 'DEBUG' } catch { Write-Log -Message "Could not save master plan file." -Level 'WARN' }
+
+                    # 2. Parse unique object names from the plan
+                    [xml]$masterPlan = $masterPlanXml
+                    $ns = New-Object System.Xml.XmlNamespaceManager($masterPlan.NameTable)
+                    $ns.AddNamespace("sql", "http://schemas.microsoft.com/sqlserver/2004/07/showplan")
+                    [string[]]$uniqueObjectNames = @(Get-ObjectsFromPlan -MasterPlan $masterPlan -NamespaceManager $ns)
+                    $statementNodes = $masterPlan.SelectNodes("//sql:StmtSimple", $ns)
+                    
+                    # 3. Build the consolidated schema document using the robust iterative method
+                    $consolidatedSchema = ""
+                    if ($null -ne $uniqueObjectNames -and $uniqueObjectNames.Count -gt 0) {
+                        Write-Log -Message "Starting schema collection for all objects..." -Level 'INFO'
+                        $objectsByDb = $uniqueObjectNames | Group-Object { ($_ -split '\.')[0] }
+
+                        foreach ($dbGroup in $objectsByDb) {
+                            $dbName = $dbGroup.Name
+                            # Skip the hidden mssqlsystemresource database as it cannot be queried directly
+                            if ($dbName -eq 'mssqlsystemresource') {
+                                Write-Log -Message "Skipping schema collection for internal database: 'mssqlsystemresource'." -Level 'DEBUG'
+                                continue
+                            }
+                            
+                            Write-Log -Message "Querying database '$dbName'..." -Level 'INFO'
+                            foreach ($objName in $dbGroup.Group) {
+                                $parts = $objName.Split('.')
+                                $consolidatedSchema += Get-ObjectSchema -ServerInstance $selectedServer -DatabaseName $parts[0] -SchemaName $parts[1] -ObjectName $parts[2]
+                            }
+                        }
+                    } else {
+                        Write-Log -Message "No user database objects were found in the execution plan for $baseName. Halting analysis for this item." -Level 'WARN'
+                        continue
+                    }
+
+                    if ([string]::IsNullOrWhiteSpace($consolidatedSchema)) {
+                         Write-Log -Message "Schema collection resulted in an empty document. This could be due to permissions or missing objects. Halting analysis for this item." -Level 'WARN'
+                         continue
+                    }
+
+                    $schemaPath = Join-Path -Path $script:AnalysisPath -ChildPath "_ConsolidatedSchema.txt"
+                    try { $consolidatedSchema | Set-Content -Path $schemaPath -Encoding UTF8; Write-Log -Message "Consolidated schema saved." -Level 'DEBUG' } catch { Write-Log -Message "Could not save consolidated schema file." -Level 'WARN' }
+
+                    # 4. Make single "Omnibus" call to AI
+                    $finalScript = Invoke-GeminiAnalysis -ModelName $script:ChosenModel -ApiKey $script:GeminiApiKey -FullSqlText $sqlQueryText -ConsolidatedSchema $consolidatedSchema -MasterPlanXml $masterPlanXml -SqlServerVersion $sqlVersion
+                    
+                    # 5. Process and save the final result
+                    if ($finalScript) {
+                        $finalScript = $finalScript.Trim()
+                        $tunedScriptPath = Join-Path -Path $script:AnalysisPath -ChildPath "${baseName}_tuned.sql"
+                        $finalScript | Out-File -FilePath $tunedScriptPath -Encoding UTF8
+                        
+                        # If requested, open the tuned file with the default application
+                        if ($OpenTunedFile.IsPresent) {
+                            Write-Log -Message "Opening tuned file: $tunedScriptPath" -Level 'INFO'
+                            try {
+                                Invoke-Item -Path $tunedScriptPath
+                            }
+                            catch {
+                                Write-Log -Message "Failed to open the tuned file automatically: $($_.Exception.Message)" -Level 'WARN'
+                            }
+                        }
+
+                        New-AnalysisSummary -TunedScript $finalScript -TotalStatementCount $statementNodes.Count -AnalysisPath $script:AnalysisPath
+                        Write-Log -Message "Analysis complete for $baseName." -Level 'SUCCESS'
+                    } else {
+                        Write-Log -Message "Analysis halted for $baseName due to an error or empty response from the AI." -Level 'ERROR'
+                    }
+                }
+                catch {
+                    Write-Log -Message "CRITICAL UNHANDLED ERROR during analysis of '$($input.BaseName)': $($_.Exception.Message). Moving to next item." -Level 'ERROR'
+                    Write-Log -Message "Stack Trace: $($_.ScriptStackTrace)" -Level 'DEBUG'
+                }
+            } # End foreach loop
+
+            Write-Log -Message "`n--- Batch Analysis Complete ---" -Level 'SUCCESS'
+            Write-Log -Message "All analysis folders for this batch are located in:" -Level 'SUCCESS'
+            Write-Log -Message "$batchFolderPath" -Level 'RESULT'
+
+            # Conditionally open the batch folder. It will be skipped if -OpenTunedFile is used without -DebugMode.
+            if ((-not $OpenTunedFile.IsPresent -or $DebugMode.IsPresent) -and $PSCmdlet.ParameterSetName -ne 'Adhoc') {
+                try {
+                    Invoke-Item -Path $batchFolderPath
+                    Write-Log -Message "Opening batch folder in File Explorer." -Level 'DEBUG'
+                } catch {
+                    Write-log -Message "Could not automatically open the batch folder. Please navigate to the path above manually." -Level 'WARN'
+                }
+            }
+            
+            # Don't prompt to run another batch if not in interactive mode
+            if ($PSCmdlet.ParameterSetName -ne 'Interactive') { break }
+
+            Write-Log -Message "`nWould you like to analyze another batch of files? (Y/N): " -Level 'PROMPT' -NoNewLine
+            $response = Read-Host
+            Write-Host ""
+            Write-Log -Message "User Input: $response" -Level 'DEBUG'
+
+        } while ($response -match '^[Yy]$')
+        Write-Log -Message "Thank you for using Optimus. Exiting." -Level 'SUCCESS'
+    }
+    finally {
+        # This block ensures that the UDP client is always closed, even if errors occur.
+        if ($null -ne $script:UdpClient) {
+            $script:UdpClient.Close()
+            $script:UdpClient.Dispose()
+            Write-Log -Message "UDP logging client has been closed." -Level "DEBUG"
+        }
+    }
 }
 
 # --- Script Entry Point ---

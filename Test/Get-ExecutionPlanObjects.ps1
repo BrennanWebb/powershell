@@ -1,12 +1,12 @@
 <#
 .SYNOPSIS
-    Intelligently retrieves execution plans for SQL queries, parsing all referenced database objects into a destination table.
+    Intelligently retrieves execution plans for SQL queries, parsing all referenced database objects into a destination table and logging any errors.
 
 .DESCRIPTION
-    This script implements a hybrid approach to retrieve execution plans. For each query, it first attempts to get the fast "Estimated Plan". If that fails (e.g., due to temporary tables), it automatically falls back to getting the "Actual Plan" by fully executing the query. This provides maximum speed while retaining 100% capability.
+    This script implements a hybrid approach to retrieve execution plans. For each query, it first attempts to get the fast "Estimated Plan". If that fails (e.g., due to temporary tables), it automatically falls back to getting the "Actual Plan" by fully executing the query. If both attempts fail, the SQL Server error message is logged to the destination table.
     It reads the source queries provided by a user-defined query, processes them in batches, parses all unique, non-temporary objects from the plans, and bulk inserts the results.
 
-    CRITICAL NOTE: For queries that require the "Actual Plan" fallback, this script will perform a full execution. While most queries will be fast, this may still result in significant server load for complex queries.
+    CRITICAL NOTE: For queries that require the "Actual Plan" fallback, this script will perform a full execution. This may still result in significant server load for complex queries.
 
 .PARAMETER SourceServer
     The FQDN or instance name of the SQL Server where the source query will be executed.
@@ -21,7 +21,7 @@
     The name of the database containing the destination table.
 
 .PARAMETER DestinationTable
-    The name of the table where the results (correlation_id and object_name) will be stored.
+    The name of the table where the results will be stored. This table must have an 'ErrorMsg' column to support error logging.
 
 .PARAMETER BatchSize
     The number of records to process from the source query's results in each iteration.
@@ -37,12 +37,13 @@
     .\Get-ExecutionPlanObjects.ps1 -SourceServer "warehouse.selectquote.com" -SourceQuery $MyQuery -DestinationServer "warehouse.selectquote.com" -DestinationDatabase "Bi_monitoring" -DestinationTable "AuditSelectsForQuickSightReporting_ObjectList" -ShowProgress
 
 .NOTES
-    Version: 5.1
+    Version: 5.4
     Author: Gemini, Powershell Developer
     Compatibility: PowerShell 5.1 or higher.
     
-    V5.0: Major architectural change to a "Hybrid" model (Try Estimated, Fallback to Actual).
-    V5.1: Re-introduced the optional -ShowProgress switch to provide an accurate overall progress bar, compatible with the V5.0 hybrid execution model.
+    V5.2: Added error logging to the destination table for failed queries.
+    V5.3: Re-introduced the optional -ShowProgress switch.
+    V5.4: Fixed a bug in the Log-ProcessingError function where SQL parameters were not being passed correctly. The function now uses a robust .NET SqlClient method.
 #>
 [CmdletBinding()]
 param(
@@ -72,12 +73,60 @@ param(
 )
 
 #region Functions
+function Log-ProcessingError {
+    param(
+        [string]$ServerInstance,
+        [string]$Database,
+        [string]$Table,
+        [string]$CorrelationId,
+        [string]$ErrorMessage
+    )
+
+    if ($DebugMode) { Write-Host -Object "DEBUG ($CorrelationId): Logging failure to destination table..." -ForegroundColor Yellow }
+    
+    $maxErrorLength = 2000
+    if ($ErrorMessage.Length -gt $maxErrorLength) {
+        $truncatedErrorMessage = $ErrorMessage.Substring(0, $maxErrorLength)
+    } else {
+        $truncatedErrorMessage = $ErrorMessage
+    }
+
+    $connection = $null
+    $command = $null
+    try {
+        $connectionString = "Server=$($ServerInstance);Database=$($Database);Integrated Security=True;TrustServerCertificate=True;"
+        $connection = New-Object System.Data.SqlClient.SqlConnection($connectionString)
+        $connection.Open()
+
+        $insertQuery = "INSERT INTO dbo.$($Table) (correlation_id, ErrorMsg) VALUES (@correlationId, @errorMsg);"
+        $command = New-Object System.Data.SqlClient.SqlCommand($insertQuery, $connection)
+        
+        # Add parameters safely to prevent SQL injection
+        $command.Parameters.AddWithValue("@correlationId", $CorrelationId) | Out-Null
+        $command.Parameters.AddWithValue("@errorMsg", $truncatedErrorMessage) | Out-Null
+        
+        $command.ExecuteNonQuery() | Out-Null
+        
+        if ($DebugMode) { Write-Host -Object "DEBUG ($CorrelationId): Successfully logged error." -ForegroundColor Green }
+    }
+    catch {
+        Write-Host -Object "FATAL: Could not log error for correlation_id '$($CorrelationId)' to the database. Error: $($_.Exception.Message)" -ForegroundColor Red
+    }
+    finally {
+        if ($null -ne $command) { $command.Dispose() }
+        if ($null -ne $connection) { $connection.Close() }
+    }
+}
+
 function Get-ExecutionPlan {
     param(
         [string]$ServerInstance,
         [string]$Database,
         [string]$SqlText,
-        [string]$CorrelationId
+        [string]$CorrelationId,
+        [string]$DestinationServer,
+        [string]$DestinationDatabase,
+        [string]$DestinationTable
     )
     
     # --- Attempt 1: Fast Path (Estimated Plan) ---
@@ -92,9 +141,7 @@ function Get-ExecutionPlan {
         foreach ($resultSet in $planResult) {
             if ($resultSet) {
                 $potentialPlan = $resultSet.Item(0)
-                if ($potentialPlan -is [string] -and $potentialPlan -like '<*showplan*>') {
-                    $planFragments += $potentialPlan
-                }
+                if ($potentialPlan -is [string] -and $potentialPlan -like '<*showplan*>') { $planFragments += $potentialPlan }
             }
         }
         
@@ -124,9 +171,7 @@ function Get-ExecutionPlan {
             foreach ($resultSet in $planResult) {
                 if ($resultSet) {
                     $potentialPlan = $resultSet.Item(0)
-                    if ($potentialPlan -is [string] -and $potentialPlan -like '<*showplan*>') {
-                        $planFragments += $potentialPlan
-                    }
+                    if ($potentialPlan -is [string] -and $potentialPlan -like '<*showplan*>') { $planFragments += $potentialPlan }
                 }
             }
         
@@ -141,7 +186,9 @@ function Get-ExecutionPlan {
             return $masterPlanXml
         }
         catch {
-             Write-Host -Object "Warning: ($CorrelationId) script failed on both Estimated and Actual plan attempts. SQL is likely invalid. Error: $($_.Exception.Message)" -ForegroundColor Red
+             $finalErrorMessage = $_.Exception.Message
+             Write-Host -Object "Warning: ($CorrelationId) script failed on both Estimated and Actual plan attempts. Logging error..." -ForegroundColor Red
+             Log-ProcessingError -ServerInstance $DestinationServer -Database $DestinationDatabase -Table $DestinationTable -CorrelationId $CorrelationId -ErrorMessage $finalErrorMessage
              return $null
         }
     }
@@ -149,9 +196,10 @@ function Get-ExecutionPlan {
 
 function Parse-PlanObjects {
     param(
-        [xml]$ExecutionPlanXml
+        [xml]$ExecutionPlanXml,
+        [string]$CorrelationId
     )
-    if ($DebugMode) { Write-Host -Object "DEBUG: Parsing execution plan to find objects..." -ForegroundColor Cyan }
+    if ($DebugMode) { Write-Host -Object "DEBUG ($CorrelationId): Parsing execution plan to find objects..." -ForegroundColor Cyan }
 
     try {
         $ns = New-Object System.Xml.XmlNamespaceManager($ExecutionPlanXml.NameTable)
@@ -171,12 +219,12 @@ function Parse-PlanObjects {
             }
         }
 
-        if ($DebugMode -and $uniqueObjectNames.Count -gt 0) { Write-Host -Object "DEBUG: Found $($uniqueObjectNames.Count) unique objects in the plan." -ForegroundColor Green }
+        if ($DebugMode -and $uniqueObjectNames.Count -gt 0) { Write-Host -Object "DEBUG ($CorrelationId): Found $($uniqueObjectNames.Count) unique objects in the plan." -ForegroundColor Green }
         
         return $uniqueObjectNames
     }
     catch {
-        Write-Host -Object "Warning: Failed to parse objects from the provided execution plan. Error: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Host -Object "Warning ($CorrelationId): Failed to parse objects from the provided execution plan. Error: $($_.Exception.Message)" -ForegroundColor Yellow
         return @()
     }
 }
@@ -185,7 +233,7 @@ function Parse-PlanObjects {
 #region Main Script Body
 function Main {
     # --- Version Header ---
-    Write-Host -Object "Running Get-ExecutionPlanObjects.ps1 - Version 5.1" -ForegroundColor White
+    Write-Host -Object "Running Get-ExecutionPlanObjects.ps1 - Version 5.4" -ForegroundColor White
     
     try {
         # --- Pre-flight Checks ---
@@ -208,7 +256,7 @@ function Main {
                 Write-Host -Object "Found a total of $totalRecordCount records to process." -ForegroundColor Green
             } catch {
                 Write-Host -Object "Warning: Could not perform initial count. Progress bar will be disabled. Error: $($_.Exception.Message)" -ForegroundColor Yellow
-                $ShowProgress = $false # Disable progress bar if the count fails
+                $ShowProgress = $false
             }
         }
 
@@ -227,9 +275,7 @@ function Main {
             $sourceDataBatch = Invoke-Sqlcmd -ServerInstance $SourceServer -Database "master" -Query $batchQuery -MaxCharLength ([int]::MaxValue) -TrustServerCertificate -ErrorAction SilentlyContinue
 
             if ($null -eq $sourceDataBatch) {
-                if ($totalRowsProcessed -eq 0) {
-                    Write-Host -Object "Warning: The source query returned an error. Please check your -SourceQuery for errors." -ForegroundColor Red
-                }
+                if ($totalRowsProcessed -eq 0) { Write-Host -Object "Warning: The source query returned an error or no data. Please check your -SourceQuery for errors." -ForegroundColor Red }
                 break 
             }
 
@@ -241,6 +287,7 @@ function Main {
             $bulkData = New-Object System.Data.DataTable
             $bulkData.Columns.Add("correlation_id", [string]) | Out-Null
             $bulkData.Columns.Add("object_name", [string]) | Out-Null
+            $bulkData.Columns.Add("ErrorMsg", [string]) | Out-Null
 
             foreach ($row in $sourceDataBatch) {
                 $recordsProcessedCounter++
@@ -259,10 +306,10 @@ function Main {
                     continue
                 }
                 
-                [xml]$plan = Get-ExecutionPlan -ServerInstance $SourceServer -Database $dbName -SqlText $sqlText -CorrelationId $correlationId
+                [xml]$plan = Get-ExecutionPlan -ServerInstance $SourceServer -Database $dbName -SqlText $sqlText -CorrelationId $correlationId -DestinationServer $DestinationServer -DestinationDatabase $DestinationDatabase -DestinationTable $DestinationTable
                 
                 if ($plan) {
-                    $foundObjects = Parse-PlanObjects -ExecutionPlanXml $plan
+                    $foundObjects = Parse-PlanObjects -ExecutionPlanXml $plan -CorrelationId $correlationId
                     
                     foreach ($objectName in $foundObjects) {
                         $newRow = $bulkData.NewRow()
@@ -275,13 +322,14 @@ function Main {
             } 
 
             if ($bulkData.Rows.Count -gt 0) {
-                Write-Host -Object "Bulk inserting $($bulkData.Rows.Count) objects found in this batch..." -ForegroundColor Cyan
+                Write-Host -Object "Bulk inserting $($bulkData.Rows.Count) successful objects found in this batch..." -ForegroundColor Cyan
                 try {
                     $bulkCopyConnectionString = "Server=$($DestinationServer);Database=$($DestinationDatabase);Integrated Security=True;TrustServerCertificate=True;"
                     $bulkCopy = New-Object System.Data.SqlClient.SqlBulkCopy($bulkCopyConnectionString)
                     $bulkCopy.DestinationTableName = $DestinationTable
                     $bulkCopy.ColumnMappings.Add("correlation_id", "correlation_id") | Out-Null
                     $bulkCopy.ColumnMappings.Add("object_name", "object_name") | Out-Null
+                    $bulkCopy.ColumnMappings.Add("ErrorMsg", "ErrorMsg") | Out-Null
                     $bulkCopy.WriteToServer($bulkData)
                     Write-Host -Object "Successfully inserted $($bulkData.Rows.Count) rows into '$($DestinationTable)'." -ForegroundColor Green
                 } catch {
@@ -290,7 +338,7 @@ function Main {
                     if ($bulkCopy) { $bulkCopy.Close() }
                 }
             } else {
-                Write-Host -Object "No objects found to insert for this batch." -ForegroundColor Cyan
+                Write-Host -Object "No new objects to insert for this batch." -ForegroundColor Cyan
             }
 
             $totalRowsProcessed += $sourceDataBatch.Count
