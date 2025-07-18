@@ -55,10 +55,13 @@
 .NOTES
     Designer: Brennan Webb & Gemini
     Script Engine: Gemini
-    Version: 1.1.1
+    Version: 1.2.2
     Created: 2025-07-18
     Modified: 2025-07-18
     Change Log:
+    - v1.2.2: Added logic to display the full Gemini API payload when -DebugMode is enabled.
+    - v1.2.1: Fixed a bug where the retry check was missing -TrustServerCertificate, causing a login error.
+    - v1.2.0: Replaced prompt in Invoke-GeminiAnalysis with a more robust "one-shot" example to improve output consistency.
     - v1.1.1: Increased AI response character limit from 4000 to 8000 in both the prompt and the truncation logic.
     - v1.1.0: Corrected the AI prompt to include the $SqlVersion variable.
     - v1.0.9: Overhauled the AI prompt to enforce a T-SQL comment block for the output format.
@@ -102,7 +105,7 @@ param (
 
 # --- Script-level Variables ---
 $script:GeminiApiKey = $null
-$script:ScriptVersion = "1.1.1"
+$script:ScriptVersion = "1.2.2"
 
 #region Logging and Prerequisite Functions
 
@@ -306,40 +309,64 @@ function Invoke-GeminiAnalysis {
     $uri = "https://generativelanguage.googleapis.com/v1beta/models/$($GeminiModel):generateContent?key=$($script:GeminiApiKey)"
 
     $prompt = @"
-### 1. Overview
-You are an expert T-SQL performance tuning assistant for Microsoft SQL Server. Your task is to analyze the provided execution plan and object schemas to identify performance bottlenecks and provide actionable tuning recommendations. 
+### 1. Persona and Goal
+You are a world-class database performance tuning expert for Microsoft SQL Server. Your sole task is to analyze the provided T-SQL execution plan and database object schemas to identify performance bottlenecks. You will then generate actionable, precise tuning recommendations.
 
-### 2. Rules for Analysis
-* Analyze the execution plan for costly operators such as Table Scans, Clustered Index Scans, Key Lookups, and large Sort operations.
-* Examine the provided object schemas (columns, data types, indexes) to formulate precise `CREATE INDEX` or `ALTER INDEX` recommendations. Ensure your recommendations are covering indexes where possible to avoid lookups.
-* Identify non-SARGable predicates in the query (e.g., functions applied to columns in a `WHERE` clause) and suggest alternative, SARGable T-SQL syntax.
+### 2. Critical Output Rules
+- Your ENTIRE response MUST be a single T-SQL block comment (`/* ... */`).
+- DO NOT use markdown, conversational text, or any language outside of the T-SQL comment block.
+- The total length must not exceed 8000 characters.
+- Each recommendation must be in a new numbered list item and strictly follow the 'Problem / Recommendation / Expected Result' format shown in the example below.
 
-### 3. Rules for Output
-* Your ENTIRE response MUST be valid T-SQL syntax, not exceeding 8000 characters. Do not include any markdown, conversational text, or explanations outside of T-SQL comments.
-* Your output must be a single T-SQL block comment (`/* ... */`).
-* Inside the block comment, format your findings as a numbered list. For each distinct issue you identify, you MUST use the following three-part structure:
+### 3. Example of Perfect Output (One-Shot Example)
+This is the exact format you must follow.
 
-1.  [A short, high-level description of the issue, e.g., 'Costly Index Scan on Table X']
-    a. Problem: A clear and concise explanation of the specific performance issue.
-    b. Recommendation: Provide the recommended T-SQL code (e.g., a complete CREATE INDEX statement or a rewritten query snippet). This code should be ready to be copied and executed.
-    c. Expected Result: Briefly describe the expected performance gain (e.g., 'This will change the operation from an Index Scan to an Index Seek, significantly reducing logical reads.').
+/*
+1. [Costly Key Lookup on Sales.SalesOrderDetail]
+    a. Problem: The query performs a Key Lookup to retrieve the 'OrderQty' and 'UnitPrice' columns. This happens because the existing non-clustered index `IX_SalesOrderDetail_ProductID` does not include these columns, forcing a second, expensive lookup into the clustered index for each qualifying row.
+    b. Recommendation: Create a new non-clustered index that 'covers' the query. This index should have the lookup key as the key column and the required extra columns in the `INCLUDE` clause.
 
-* If you have multiple recommendations, create a new numbered entry for each one inside the same single T-SQL block comment.
+       CREATE NONCLUSTERED INDEX [IX_SalesOrderDetail_ProductID_Covering]
+       ON [Sales].[SalesOrderDetail] ([ProductID])
+       INCLUDE ([OrderQty],[UnitPrice]);
 
+    c. Expected Result: This new covering index will allow the server to satisfy the entire query with a single Index Seek operation, eliminating the costly Key Lookup and significantly reducing logical I/O and query duration.
+
+2. [Non-SARGable Predicate on OrderDate]
+    a. Problem: The `WHERE` clause uses `ISNULL(o.OrderDate, '1900-01-01') = '2011-05-31'`, which applies a function to the `OrderDate` column. This prevents the query optimizer from using an index on `OrderDate`, resulting in an inefficient scan.
+    b. Recommendation: Rewrite the predicate to be SARGable (Searchable Argument).
+
+       WHERE (o.OrderDate = '2011-05-31' OR o.OrderDate IS NULL)
+
+    c. Expected Result: This rewritten predicate allows the optimizer to perform an Index Seek on the `OrderDate` column if a suitable index exists, dramatically improving query performance.
+*/
+
+### 4. Instruction for No Findings
+If you analyze the plan and find no significant performance improvements, your entire response MUST be the following T-SQL block comment:
+/*
+No tuning recommendations found. The query plan appears optimal given the provided schemas.
+*/
 
 ---
-### 4. SQL SERVER VERSION
+### 5. SQL SERVER VERSION
 You must ensure all generated T-SQL syntax is compatible with this version:
 $SqlVersion
 
 ---
-### 5. EXECUTION PLAN XML
+### 6. EXECUTION PLAN XML
 $ExecutionPlan
 
 ---
-### 6. OBJECT SCHEMAS
+### 7. OBJECT SCHEMAS
 $SchemaDocument
 "@
+
+    # If debug mode is on, write the exact payload to the console for review.
+    if ($DebugMode) {
+        Write-Host "`n--- START GEMINI PAYLOAD (PROMPT) ---" -ForegroundColor Cyan
+        Write-Host $prompt -ForegroundColor Cyan
+        Write-Host "--- END GEMINI PAYLOAD (PROMPT) ---`n" -ForegroundColor Cyan
+    }
 
     $bodyObject = @{ contents = @( @{ parts = @( @{ text = $prompt } ) } ) }
     $bodyJson = $bodyObject | ConvertTo-Json -Depth 10
@@ -442,7 +469,6 @@ function Start-OptimusQS {
             }
 
             if (-not [string]::IsNullOrWhiteSpace($tuningResponse)) {
-                # **FIX:** Increased truncation length and updated warning message.
                 if ($tuningResponse.Length -gt 8000) {
                     $tuningResponse = $tuningResponse.Substring(0, 8000)
                     Write-SqlLog -Level 'WARN' -Message "ID: $currentId - AI response was truncated to 8000 characters."
@@ -464,7 +490,7 @@ function Start-OptimusQS {
             }
         } 
 
-        if ($retryCount -le $MaxRetries -and (Invoke-Sqlcmd -ServerInstance $ServerName -Database $dbNameForData -Query "SELECT COUNT(*) FROM $FullObjectName WHERE tuning_response IS NULL AND execution_plan_xml IS NOT NULL;").Item(0) -gt 0) {
+        if ($retryCount -le $MaxRetries -and (Invoke-Sqlcmd -ServerInstance $ServerName -Database $dbNameForData -Query "SELECT COUNT(*) FROM $FullObjectName WHERE tuning_response IS NULL AND execution_plan_xml IS NOT NULL;" -TrustServerCertificate).Item(0) -gt 0) {
             $delaySeconds = 60
             Write-SqlLog -Level 'INFO' -Message "Analysis Pass #$($retryCount) complete. Waiting for $delaySeconds seconds before next attempt."
             Start-Sleep -Seconds $delaySeconds
