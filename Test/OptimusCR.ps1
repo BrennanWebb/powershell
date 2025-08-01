@@ -10,6 +10,8 @@
     It can process a T-SQL script from a single file, a list of files, all .sql files in a specified folder, or a raw T-SQL string.
     All execution steps, messages, and recommendations are recorded in a detailed log file for each analysis.
 
+    It also includes a utility to easily import new prompts from .txt files.
+
 .PARAMETER SQLFile
     The path to one or more .sql files to be analyzed. For multiple files, provide a comma-separated list. This parameter
     cannot be used with -FolderPath or -AdhocSQL.
@@ -44,6 +46,12 @@
     An optional switch to trigger an interactive menu that allows for resetting user configurations.
     This can be used to clear the saved API key, server list, and optionally, all past analysis reports.
 
+.PARAMETER ImportPrompt
+    A switch to activate the prompt import utility. Must be used with the -Path parameter. This bypasses all analysis workflows.
+
+.PARAMETER Path
+    When used with -ImportPrompt, specifies the path to the .txt file containing the body of the new prompt to be imported.
+
 .PARAMETER DebugMode
     Enables detailed diagnostic output to the console. All messages are always written to the execution log file regardless of this setting.
 
@@ -52,24 +60,21 @@
     Runs an interactive performance tuning analysis on all .sql files in the folder.
 
 .EXAMPLE
-    .\Optimus.ps1 -FolderPath "C:\My TSQL Projects\StoredProcs" -CodeReview
-    Runs a code review on all .sql files, prompting to select a code review prompt.
-
-.EXAMPLE
-    .\Optimus.ps1 -AdhocSQL "SELECT * FROM Sales.SalesOrderHeader" -PromptName "My Custom Tuning Prompt"
-    Runs a tuning analysis on the ad-hoc query using a specific, user-defined prompt from prompts.json.
+    .\Optimus.ps1 -ImportPrompt -Path "C:\MyPrompts\NewTuningPrompt.txt"
+    Starts the prompt import utility to add the prompt from the specified .txt file to the configuration.
 
 .NOTES
     Designer: Brennan Webb & Gemini
     Script Engine: Gemini
-    Version: 3.0.3
+    Version: 3.2.5
     Created: 2025-06-21
-    Modified: 2025-07-18
+    Modified: 2025-07-31
     Change Log:
-    - v3.0.3: Fixed logic to correctly select the default option in interactive menus when the user presses Enter.
-    - v3.0.2: Fixed infinite loop in prompt selection menu when only one prompt of a given type exists.
-    - v3.0.1: Fixed infinite loop in interactive mode when selecting analysis type.
-    - v3.0.0: Major architectural refactor. Prompts are now stored externally in prompts.json, allowing for easy customization and testing. Added -PromptName parameter and interactive selection menu.
+    - v3.2.5: Removed literal Markdown from default prompt text to prevent AI confusion.
+    - v3.2.4: Added backspace escaping to the manual JSON serializer for full compliance.
+    - v3.2.3: Centralized JSON creation to use the manual serializer, ensuring valid output on first run.
+    - v3.2.2: Added tab character escaping to the manual JSON serializer to ensure full JSON compliance.
+    - v3.2.1: Corrected string escaping logic in the manual JSON serializer.
 
     Powershell Version: 5.1+
 #>
@@ -84,23 +89,55 @@ param (
     [Parameter(Mandatory=$true, ParameterSetName='Adhoc')]
     [string]$AdhocSQL,
 
-    [Parameter(Mandatory=$false)]
+    [Parameter(Mandatory=$false, ParameterSetName='Files')]
+    [Parameter(Mandatory=$false, ParameterSetName='Folder')]
+    [Parameter(Mandatory=$false, ParameterSetName='Adhoc')]
+    [Parameter(Mandatory=$false, ParameterSetName='Interactive')]
     [switch]$CodeReview,
 
-    [Parameter(Mandatory=$false)]
+    [Parameter(Mandatory=$false, ParameterSetName='Files')]
+    [Parameter(Mandatory=$false, ParameterSetName='Folder')]
+    [Parameter(Mandatory=$false, ParameterSetName='Adhoc')]
+    [Parameter(Mandatory=$false, ParameterSetName='Interactive')]
     [string]$PromptName,
 
-    [Parameter(Mandatory=$false)]
+    [Parameter(Mandatory=$false, ParameterSetName='Files')]
+    [Parameter(Mandatory=$false, ParameterSetName='Folder')]
+    [Parameter(Mandatory=$false, ParameterSetName='Adhoc')]
+    [Parameter(Mandatory=$false, ParameterSetName='Interactive')]
     [string]$ServerName,
 
-    [Parameter(Mandatory=$false)]
+    [Parameter(Mandatory=$false, ParameterSetName='Files')]
+    [Parameter(Mandatory=$false, ParameterSetName='Folder')]
+    [Parameter(Mandatory=$false, ParameterSetName='Adhoc')]
+    [Parameter(Mandatory=$false, ParameterSetName='Interactive')]
     [switch]$UseActualPlan,
 
-    [Parameter(Mandatory=$false)]
+    [Parameter(Mandatory=$false, ParameterSetName='Files')]
+    [Parameter(Mandatory=$false, ParameterSetName='Folder')]
+    [Parameter(Mandatory=$false, ParameterSetName='Adhoc')]
+    [Parameter(Mandatory=$false, ParameterSetName='Interactive')]
     [switch]$OpenTunedFile,
     
     [Parameter(Mandatory=$false)]
     [switch]$ResetConfiguration,
+
+    [Parameter(Mandatory=$true, ParameterSetName='ImportPrompt')]
+    [switch]$ImportPrompt,
+
+    [Parameter(Mandatory=$true, ParameterSetName='ImportPrompt')]
+    [ValidateScript({
+        if (Test-Path -Path $_ -PathType Leaf) {
+            if ($_ -like '*.txt') {
+                return $true
+            } else {
+                throw "The file '$_' is not a .txt file."
+            }
+        } else {
+            throw "The path '$_' does not exist or is not a file."
+        }
+    })]
+    [string]$Path,
 
     [Parameter(Mandatory=$false)]
     [switch]$DebugMode
@@ -285,7 +322,7 @@ You should consider the following categories of recommendations. For any given T
     * **Create New Index:** If no existing index is a suitable candidate for alteration, recommend a new, covering index. Provide the complete `CREATE INDEX` DDL.
 
 Comment Formatting:
-Every analysis comment block you add MUST use the following structure. The block starts with a general "Optimus Analysis" header. Inside, each distinct recommendation is numbered and contains the three required sections. This allows for multiple, independent suggestions for the same statement. Important: All text inside the comment block must be plain text. Do not use any Markdown formatting like **bolding** or `backticks`.
+Every analysis comment block you add MUST use the following structure. The block starts with a general "Optimus Analysis" header. Inside, each distinct recommendation is numbered and contains the three required sections. This allows for multiple, independent suggestions for the same statement. Important: All text inside the comment block must be plain text. Do not use any Markdown formatting like bolding or backticks.
 
 /*
 --- Optimus Analysis ---
@@ -335,12 +372,12 @@ Your goal is to perform a static code analysis on the provided T-SQL script. You
 Code Review Categories:
 Analyze the script against these standardized best practices:
 1.  **Readability & Formatting:** Consistent casing, clear comments, logical code structure, and proper indentation.
-2.  **Best Practices:** Correct use of `SET NOCOUNT ON`, schema-qualification for all database objects (e.g., `dbo.MyTable`), avoiding `SELECT *` in production code, using `EXISTS` instead of `IN` where appropriate.
+2.  **Best Practices:** Correct use of `SET NOCOUNT ON`, schema-qualification for all database objects (e.g., dbo.MyTable), avoiding `SELECT *` in production code, using `EXISTS` instead of `IN` where appropriate.
 3.  **Error Handling:** Presence and correct implementation of `TRY...CATCH` blocks for DML statements. Verification that transaction management (`BEGIN TRAN`, `COMMIT`, `ROLLBACK`) is handled correctly within the `TRY...CATCH` structure.
 4.  **Maintainability:** Avoiding "magic numbers" or hard-coded strings that should be parameters, use of meaningful and consistent object and variable names.
 
 Comment Formatting:
-Every review comment block you add MUST use the following structure. The block starts with a "Optimus Code Review" header. Inside, each distinct review item is numbered. Important: All text inside the comment block must be plain text. Do not use any Markdown formatting like **bolding** or `backticks`.
+Every review comment block you add MUST use the following structure. The block starts with a "Optimus Code Review" header. Inside, each distinct review item is numbered. Important: All text inside the comment block must be plain text. Do not use any Markdown formatting like bolding or backticks.
 
 /*
 --- Optimus Code Review ---
@@ -364,7 +401,9 @@ Final Output Rules:
     }
 
     try {
-        $defaultPrompts | ConvertTo-Json -Depth 10 | Set-Content -Path $promptFile -Encoding UTF8
+        # Use our robust manual serializer to ensure a valid JSON file is always created
+        $jsonOutputString = ConvertTo-JsonManual -prompts $defaultPrompts.prompts
+        $jsonOutputString | Out-File -FilePath $promptFile -Encoding UTF8
         Write-Log -Message "Successfully created and seeded prompts.json." -Level 'SUCCESS'
     } catch {
         Write-Log -Message "Failed to create prompts.json: $($_.Exception.Message)" -Level 'ERROR'
@@ -491,6 +530,144 @@ function Get-And-Set-Model {
     } catch {
         Write-Log -Message "Failed to save model configuration: $($_.Exception.Message)" -Level 'ERROR'
         return $null
+    }
+}
+
+function ConvertTo-JsonManual {
+    param($prompts)
+
+    # Use .NET StringBuilder for robust, efficient string construction
+    $sb = New-Object System.Text.StringBuilder
+    $sb.AppendLine("{") | Out-Null
+    $sb.AppendLine("  `"prompts`": [") | Out-Null
+
+    for ($i = 0; $i -lt $prompts.Count; $i++) {
+        $prompt = $prompts[$i]
+
+        # Correctly escape all string properties for JSON compliance.
+        # The order of replacement is critical: backslashes must be escaped first.
+        $name = $prompt.name -replace '\\', '\\' -replace '"', '\"' -replace "`r", '\r' -replace "`n", '\n' -replace "`t", '\t' -replace "`b", '\b'
+        $type = $prompt.type -replace '\\', '\\' -replace '"', '\"' -replace "`r", '\r' -replace "`n", '\n' -replace "`t", '\t' -replace "`b", '\b'
+        $desc = $prompt.description -replace '\\', '\\' -replace '"', '\"' -replace "`r", '\r' -replace "`n", '\n' -replace "`t", '\t' -replace "`b", '\b'
+        $body = $prompt.body -replace '\\', '\\' -replace '"', '\"' -replace "`r", '\r' -replace "`n", '\n' -replace "`t", '\t' -replace "`b", '\b'
+
+        # Append the JSON structure for a single prompt
+        $sb.AppendLine("    {") | Out-Null
+        $sb.AppendLine("      `"name`": `"$name`",") | Out-Null
+        $sb.AppendLine("      `"type`": `"$type`",") | Out-Null
+        $sb.AppendLine("      `"description`": `"$desc`",") | Out-Null
+        $sb.AppendLine("      `"body`": `"$body`"") | Out-Null
+        $sb.Append("    }") | Out-Null
+
+        # Add a comma if it's not the last item in the array
+        if ($i -lt $prompts.Count - 1) {
+            $sb.AppendLine(",") | Out-Null
+        } else {
+            $sb.AppendLine() | Out-Null
+        }
+    }
+
+    $sb.AppendLine("  ]") | Out-Null
+    $sb.Append("}") | Out-Null
+
+    return $sb.ToString()
+}
+
+function Import-UserPrompt {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$FilePath
+    )
+    Write-Log -Message "Entering Function: Import-UserPrompt" -Level 'DEBUG'
+    Write-Log -Message "`n--- Optimus Prompt Import Utility ---" -Level 'SUCCESS'
+
+    try {
+        $fileContent = Get-Content -Path $FilePath -Raw
+        Write-Log -Message "Successfully read file: $(Split-Path $FilePath -Leaf)" -Level 'INFO'
+    } catch {
+        Write-Log -Message "Failed to read the file at '$FilePath'. Error: $($_.Exception.Message)" -Level 'ERROR'
+        return
+    }
+
+    # Gather Metadata
+    $defaultName = [System.IO.Path]::GetFileNameWithoutExtension($FilePath)
+    Write-Log -Message "Please provide a name for this new prompt (press Enter to use '$defaultName'): " -Level 'PROMPT' -NoNewLine
+    $promptName = Read-Host
+    if ([string]::IsNullOrWhiteSpace($promptName)) { $promptName = $defaultName }
+    Write-Host ""
+    Write-Log -Message "User Input: $promptName" -Level 'DEBUG'
+
+    $promptType = $null
+    while (-not $promptType) {
+        Write-Log -Message "What type of prompt is this?" -Level 'PROMPT'
+        Write-Log -Message "  [1] Tuning" -Level 'PROMPT'
+        Write-Log -Message "  [2] CodeReview" -Level 'PROMPT'
+        Write-Log -Message "Enter your choice: " -Level 'PROMPT' -NoNewLine
+        $choice = Read-Host
+        Write-Host ""
+        Write-Log -Message "User Input: $choice" -Level 'DEBUG'
+        switch ($choice) {
+            '1' { $promptType = 'Tuning' }
+            '2' { $promptType = 'CodeReview' }
+            default { Write-Log -Message "Invalid selection. Please enter 1 or 2." -Level 'ERROR' }
+        }
+    }
+
+    Write-Log -Message "Please provide a brief description for this prompt: " -Level 'PROMPT' -NoNewLine
+    $promptDescription = Read-Host
+    Write-Host ""
+    Write-Log -Message "User Input: $promptDescription" -Level 'DEBUG'
+
+    # Confirmation
+    Write-Log -Message "`n--- Confirmation ---" -Level 'WARN'
+    Write-Log -Message "A new prompt will be added with the following details:" -Level 'INFO'
+    Write-Log -Message "  Name:        $promptName" -Level 'PROMPT'
+    Write-Log -Message "  Type:        $promptType" -Level 'PROMPT'
+    Write-Log -Message "  Description: $promptDescription" -Level 'PROMPT'
+    
+    Write-Log -Message "`nAre you sure you want to add this prompt? (Y/N): " -Level 'PROMPT' -NoNewLine
+    $confirm = Read-Host
+    Write-Host ""
+    Write-Log -Message "User Input: $confirm" -Level 'DEBUG'
+
+    if ($confirm -notmatch '^[Yy]$') {
+        Write-Log -Message "Import cancelled by user." -Level 'WARN'
+        return
+    }
+
+    # Add to JSON
+    try {
+        $promptFile = $script:OptimusConfig.PromptFile
+        Write-Log -Message "Attempting to read prompts configuration from: $promptFile" -Level 'DEBUG'
+        $promptList = [System.Collections.Generic.List[pscustomobject]](Get-Content -Path $promptFile -Raw | ConvertFrom-Json).prompts
+        Write-Log -Message "Current prompt count: $($promptList.Count)" -Level 'DEBUG'
+        
+        $newPrompt = [pscustomobject]@{
+            name        = $promptName
+            type        = $promptType
+            description = $promptDescription
+            body        = $fileContent
+        }
+        Write-Log -Message "New prompt object created. Adding to configuration." -Level 'DEBUG'
+
+        # Add the new prompt to the .NET List
+        $promptList.Add($newPrompt)
+
+        # Rebuild the final configuration object using the stable list
+        $finalConfig = @{
+            prompts = $promptList
+        }
+        Write-Log -Message "New prompt count: $($finalConfig.prompts.Count)" -Level 'DEBUG'
+        
+        Write-Log -Message "Attempting to convert the final configuration object to a JSON string using manual serializer." -Level 'DEBUG'
+        $jsonOutputString = ConvertTo-JsonManual -prompts $finalConfig.prompts
+        Write-Log -Message "Successfully converted object to JSON string. Length: $($jsonOutputString.Length)" -Level 'DEBUG'
+        
+        Write-Log -Message "Attempting to write JSON string to file: $promptFile" -Level 'DEBUG'
+        $jsonOutputString | Out-File -FilePath $promptFile -Encoding UTF8
+        Write-Log -Message "Success! The new prompt '$promptName' has been added to your configuration." -Level 'SUCCESS'
+    } catch {
+        Write-Log -Message "Failed to update prompts.json. Error: $($_.Exception.Message)" -Level 'ERROR'
     }
 }
 #endregion
@@ -1402,21 +1579,29 @@ function Start-CodeReviewAnalysis {
 # --- Main Application Logic ---
 function Start-Optimus {
     # Define the current version of the script in one place.
-    $script:CurrentVersion = "3.0.3"
+    $script:CurrentVersion = "3.2.5"
 
     if ($DebugMode) { Write-Log -Message "Starting Optimus v$($script:CurrentVersion) in Debug Mode." -Level 'DEBUG'}
 
-    # Group prerequisite checks
+    # On first run, or if config is reset, set up the .optimus directory and files.
+    if ($ResetConfiguration) {
+        if (-not (Reset-OptimusConfiguration)) {
+            Write-Log -Message "Reset cancelled by user. Exiting script." -Level 'WARN'
+            return
+        }
+    }
+    if (-not (Initialize-Configuration)) { return }
+
+    # Handle the prompt import utility mode
+    if ($PSCmdlet.ParameterSetName -eq 'ImportPrompt') {
+        Import-UserPrompt -FilePath $Path
+        return # Exit after import
+    }
+
+    # Group prerequisite checks for analysis workflows
     $checksPassed = {
         if (-not (Test-WindowsEnvironment)) { return $false }
         if (-not (Test-PowerShellVersion)) { return $false }
-        if ($ResetConfiguration) {
-            if (-not (Reset-OptimusConfiguration)) {
-                Write-Log -Message "Reset cancelled by user. Exiting script." -Level 'WARN'
-                return $false
-            }
-        }
-        if (-not (Initialize-Configuration)) { return $false }
         if (-not (Test-InternetConnection)) { Write-Log -Message "Exiting due to no internet connection or user choice." -Level 'ERROR'; return $false }
         Invoke-OptimusVersionCheck -CurrentVersion $script:CurrentVersion
         if (-not (Get-And-Set-ApiKey)) { Write-Log -Message "Exiting due to missing API key." -Level 'ERROR'; return $false }
