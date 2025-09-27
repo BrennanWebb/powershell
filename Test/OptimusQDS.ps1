@@ -30,10 +30,15 @@
 .NOTES
     Designer: Brennan Webb & Gemini
     Script Engine: Gemini
-    Version: 3.5.3
+    Version: 3.5.5
     Created: 2025-07-23
-    Modified: 2025-07-28
+    Modified: 2025-09-27
     Change Log:
+    - v3.5.5: Updated default model names to stable, modern identifiers (gemini-2.5-flash).
+              Reverted API URL construction in Invoke-GeminiAnalysis to use the colon-syntax (:) which is supported for most Gemini model names, resolving the 404 error caused by an unstable model name.
+    - v3.5.4: Fixed the Gemini API URL to use '/' instead of ':' to resolve 404 errors. 
+              Corrected the SQL UPDATE statement for Analysis_Meta to handle null/failed API responses, resolving the 'Incorrect syntax near WHERE' error.
+              Updated default model names to stable identifiers (e.g., 'gemini-1.5-flash').
     - v3.5.3: Added ON DELETE CASCADE to all relevant foreign keys to simplify data cleanup.
     - v3.5.2: Removed the 24-hour time filter from Get-WorstOffenders to analyze the entire QDS retention period.
     - v3.5.1: Standardized the T-SQL formulas for all default metrics for consistency and accuracy.
@@ -63,7 +68,7 @@ param(
 )
 
 # --- Script-level Variables ---
-$script:ScriptVersion = "3.5.3"
+$script:ScriptVersion = "3.5.5"
 
 #region Helper Functions
 function Write-Log {
@@ -155,9 +160,9 @@ CREATE TABLE dbo.Analysis_Debug (DebugID INT PRIMARY KEY IDENTITY, AnalysisMetaI
     $insertDataQuery = @"
 USE [$DbName];
 INSERT INTO dbo.Config_Model (ModelName, IsDefault) VALUES
-('gemini-1.5-flash-latest', 1),
-('gemini-1.5-pro-latest', 0),
-('gemini-1.0-pro', 0);
+('gemini-2.5-flash', 1),
+('gemini-2.5-pro', 0),
+('gemini-1.5-pro', 0);
 INSERT INTO dbo.Config_Metric (MetricName, MetricDescription, MetricFormula, IsDefault) VALUES
 ('Memory Cost Score', 'A weighted score based on total duration, execution count, and total memory grant size.', '(SUM(rs.avg_duration) * SUM(rs.count_executions) * SUM(rs.avg_query_max_used_memory))', 1),
 ('Total CPU', 'Ranks queries by the total CPU time multiplied by execution count.', '(SUM(rs.avg_cpu_time) * SUM(rs.count_executions))', 0),
@@ -422,6 +427,7 @@ function Get-ObjectSchemaDetails {
 function Invoke-GeminiAnalysis {
     param($QuerySqlText, $ExecutionPlan, $SchemaDetails, $AnalysisMetaID)
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    # FIX: Reverting to colon-syntax as it is the format used in the working client script, but ensuring stable model names are used.
     $uri = "https://generativelanguage.googleapis.com/v1beta/models/$($script:Configuration.ModelName):generateContent?key=$($script:Configuration.ApiKey)"
     $fullPrompt = "$($script:Configuration.PromptText)`n`n### T-SQL QUERY`n$QuerySqlText`n`n### EXECUTION PLAN XML`n$ExecutionPlan`n`n### OBJECT SCHEMAS`n$SchemaDetails"
     Write-DebugLog -AnalysisMetaID $AnalysisMetaID -Message "Sending Gemini Payload: $fullPrompt"
@@ -433,7 +439,11 @@ function Invoke-GeminiAnalysis {
         Write-Log -Level 'SUCCESS' -Message "Successfully received analysis from Gemini AI in $($stopwatch.Elapsed.TotalSeconds) seconds."
         return @{ Response = $rawAiResponse.Trim(); DurationMS = [int]$stopwatch.Elapsed.TotalMilliseconds }
     }
-    catch { Write-Log -Level 'ERROR' -Message "Failed to get response from Gemini API. Error: $($_.Exception.Message)"; return $null }
+    catch { 
+        Write-Log -Level 'ERROR' -Message "Failed to get response from Gemini API. Error: $($_.Exception.Message)"
+        Write-Log -Level 'DEBUG' -Message "Attempted URI: $uri" 
+        return $null 
+    }
 }
 
 function Write-AnalysisMeta {
@@ -554,9 +564,19 @@ else {
 
             $analysisResult = Invoke-GeminiAnalysis -QuerySqlText $offender.query_sql_text -ExecutionPlan $offender.query_plan -SchemaDetails $schemaDetails -AnalysisMetaID $metaId
             
-            $updateMetaQuery = "UPDATE dbo.Analysis_Meta SET ObjectsParsed = $($planObjects.Count), AnalysisDurationMS = $($analysisResult.DurationMS) WHERE AnalysisMetaID = $metaId;"
-            Write-DebugLog -AnalysisMetaID $metaId -Message "Executing SQL: $updateMetaQuery"
-            Invoke-Sqlcmd -ServerInstance $ServerName -Database $DatabaseName -Query $updateMetaQuery -TrustServerCertificate
+            # Safely get duration, defaulting to 0 if API call failed
+            $durationToLog = if ($null -ne $analysisResult) { $analysisResult.DurationMS } else { 0 }
+
+            if ($null -ne $metaId) { # Only attempt to update if meta record was created successfully
+                $updateMetaQuery = "UPDATE dbo.Analysis_Meta SET ObjectsParsed = $($planObjects.Count), AnalysisDurationMS = $durationToLog WHERE AnalysisMetaID = $metaId;"
+                Write-DebugLog -AnalysisMetaID $metaId -Message "Executing SQL: $updateMetaQuery"
+                try {
+                    Invoke-Sqlcmd -ServerInstance $ServerName -Database $DatabaseName -Query $updateMetaQuery -TrustServerCertificate -ErrorAction Stop
+                }
+                catch {
+                    Write-Log -Level 'ERROR' -Message "Failed to update AnalysisMetaID $metaId. Error: $($_.Exception.Message)"
+                }
+            }
 
             if ($null -ne $analysisResult -and -not [string]::IsNullOrWhiteSpace($analysisResult.Response)) {
                 $cleanedResponse = $analysisResult.Response.Trim().Trim("/*").Trim("*/").Trim()
