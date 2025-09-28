@@ -30,10 +30,13 @@
 .NOTES
     Designer: Brennan Webb & Gemini
     Script Engine: Gemini
-    Version: 3.5.5
+    Version: 3.5.6
     Created: 2025-07-23
     Modified: 2025-09-27
     Change Log:
+    - v3.5.6: FIXED: Arithmetic Overflow Error converting expression to data type bigint (Msg 8115) by changing the MetricValue column in dbo.Analysis_Meta to NUMERIC(38, 0) and explicitly casting the MetricFormula in Get-WorstOffenders.
+              FIXED: 'Cannot validate argument on parameter Level' error by adding 'DEBUG' to the ValidateSet of the Write-Log function.
+              Improved debug logging robustness by removing -ErrorAction Stop from Invoke-Sqlcmd inside Write-DebugLog.
     - v3.5.5: Updated default model names to stable, modern identifiers (gemini-2.5-flash).
               Reverted API URL construction in Invoke-GeminiAnalysis to use the colon-syntax (:) which is supported for most Gemini model names, resolving the 404 error caused by an unstable model name.
     - v3.5.4: Fixed the Gemini API URL to use '/' instead of ':' to resolve 404 errors. 
@@ -68,7 +71,7 @@ param(
 )
 
 # --- Script-level Variables ---
-$script:ScriptVersion = "3.5.5"
+$script:ScriptVersion = "3.5.6"
 
 #region Helper Functions
 function Write-Log {
@@ -76,11 +79,12 @@ function Write-Log {
         [Parameter(Mandatory = $true)]
         [string]$Message,
         [Parameter(Mandatory = $true)]
-        [ValidateSet('INFO', 'SUCCESS', 'WARN', 'ERROR', 'PROMPT')]
+        [ValidateSet('INFO', 'SUCCESS', 'WARN', 'ERROR', 'PROMPT', 'DEBUG')] # ADDED 'DEBUG'
         [string]$Level
     )
     $color = 'Cyan'
     switch ($Level) {
+        'DEBUG'   { $color = 'Gray' }
         'SUCCESS' { $color = 'Green' }
         'WARN'    { $color = 'Yellow' }
         'ERROR'   { $color = 'Red' }
@@ -152,7 +156,7 @@ CREATE TABLE dbo.Config_Metric (MetricID INT PRIMARY KEY IDENTITY, MetricName VA
 CREATE TABLE dbo.Config_ApiKey (ApiKeyID INT PRIMARY KEY IDENTITY, ApiKeyName VARCHAR(100) NOT NULL, ApiKeyValueEncrypted VARBINARY(256) NOT NULL);
 
 CREATE TABLE dbo.Analysis_Run (RunID INT PRIMARY KEY IDENTITY, RunTimestamp DATETIME DEFAULT GETDATE());
-CREATE TABLE dbo.Analysis_Meta (AnalysisMetaID INT PRIMARY KEY IDENTITY, RunID INT NOT NULL, MetricID INT NOT NULL, ModelID INT NOT NULL, PromptID INT NOT NULL, SourceQueryID BIGINT NOT NULL, ObjectDatabase sysname NULL, ObjectSchema sysname NULL, ObjectName sysname NULL, MetricValue BIGINT NULL, ObjectsParsed INT NULL, AnalysisDurationMS INT NULL, DatabaseRank INT NULL, ServerRank INT NULL, CONSTRAINT FK_Analysis_Meta_Run FOREIGN KEY (RunID) REFERENCES dbo.Analysis_Run(RunID) ON DELETE CASCADE, CONSTRAINT FK_Analysis_Meta_Metric FOREIGN KEY (MetricID) REFERENCES dbo.Config_Metric(MetricID), CONSTRAINT FK_Analysis_Meta_Model FOREIGN KEY (ModelID) REFERENCES dbo.Config_Model(ModelID), CONSTRAINT FK_Analysis_Meta_Prompt FOREIGN KEY (PromptID) REFERENCES dbo.Config_Prompt(PromptID));
+CREATE TABLE dbo.Analysis_Meta (AnalysisMetaID INT PRIMARY KEY IDENTITY, RunID INT NOT NULL, MetricID INT NOT NULL, ModelID INT NOT NULL, PromptID INT NOT NULL, SourceQueryID BIGINT NOT NULL, ObjectDatabase sysname NULL, ObjectSchema sysname NULL, ObjectName sysname NULL, MetricValue NUMERIC(38, 0) NULL, ObjectsParsed INT NULL, AnalysisDurationMS INT NULL, DatabaseRank INT NULL, ServerRank INT NULL, CONSTRAINT FK_Analysis_Meta_Run FOREIGN KEY (RunID) REFERENCES dbo.Analysis_Run(RunID) ON DELETE CASCADE, CONSTRAINT FK_Analysis_Meta_Metric FOREIGN KEY (MetricID) REFERENCES dbo.Config_Metric(MetricID), CONSTRAINT FK_Analysis_Meta_Model FOREIGN KEY (ModelID) REFERENCES dbo.Config_Model(ModelID), CONSTRAINT FK_Analysis_Meta_Prompt FOREIGN KEY (PromptID) REFERENCES dbo.Config_Prompt(PromptID));
 CREATE TABLE dbo.Analysis_Result (AnalysisResultID INT PRIMARY KEY IDENTITY, AnalysisMetaID INT NOT NULL, TuningResponseType VARCHAR(50) NULL, TuningResponse NVARCHAR(MAX) NULL, CONSTRAINT FK_Analysis_Result_Meta FOREIGN KEY (AnalysisMetaID) REFERENCES dbo.Analysis_Meta(AnalysisMetaID) ON DELETE CASCADE);
 CREATE TABLE dbo.Analysis_Debug (DebugID INT PRIMARY KEY IDENTITY, AnalysisMetaID INT NULL, DebugFunctionName VARCHAR(255) NOT NULL, Message VARCHAR(MAX) NOT NULL, LogTimestamp DATETIME DEFAULT GETDATE(), CONSTRAINT FK_Analysis_Debug_Meta FOREIGN KEY (AnalysisMetaID) REFERENCES dbo.Analysis_Meta(AnalysisMetaID) ON DELETE CASCADE);
 "@
@@ -293,10 +297,12 @@ function Write-DebugLog {
         $sanitizedMessage = $Message.Replace("'", "''")
         $query = "INSERT INTO dbo.Analysis_Debug (AnalysisMetaID, DebugFunctionName, Message) VALUES ($metaIdToLog, '$sanitizedFunction', '$sanitizedMessage');"
         try {
-            Invoke-Sqlcmd -ServerInstance $ServerName -Database $DatabaseName -Query $query -TrustServerCertificate -ErrorAction Stop
+            # Removed -ErrorAction Stop to make debug logging more resilient to broken connections.
+            Invoke-Sqlcmd -ServerInstance $ServerName -Database $DatabaseName -Query $query -TrustServerCertificate -ErrorAction Continue
         }
         catch {
-            Write-Host "[CRITICAL] Failed to write to the debug log table: $($_.Exception.Message)" -ForegroundColor Red
+            # Use Write-Log here for consistent error output
+            Write-Log -Level 'ERROR' -Message "[CRITICAL] Failed to write to the debug log table: $($_.Exception.Message)"
         }
     }
 }
@@ -372,7 +378,7 @@ WITH R AS (
         DB_NAME() AS ObjectDatabase,
         s.name AS ObjectSchema,
         o.name AS ObjectName,
-        $($script:Configuration.MetricFormula) AS MetricValue, 
+        CAST($($script:Configuration.MetricFormula) AS NUMERIC(38, 0)) AS MetricValue, 
         ROW_NUMBER() OVER(ORDER BY $($script:Configuration.MetricFormula) DESC) as rn 
     FROM sys.query_store_query AS q 
     JOIN sys.query_store_query_text AS qt ON q.query_text_id = qt.query_text_id 
@@ -395,7 +401,7 @@ ORDER BY rn;
         Write-Log -Level 'SUCCESS' -Message "Identified $($offenders.Count) offenders in '$TargetDb'."
         return $offenders
     }
-    catch { Write-Log -Level 'WARN' -Message "Could not retrieve offenders from '$TargetDb'. It may have no recent QDS data."; return @() }
+    catch { Write-Log -Level 'WARN' -Message "Could not retrieve offenders from '$TargetDb'. It may have no recent QDS data. Error: $($_.Exception.Message)"; return @() }
 }
 
 function Get-ObjectsFromPlan {
@@ -427,7 +433,6 @@ function Get-ObjectSchemaDetails {
 function Invoke-GeminiAnalysis {
     param($QuerySqlText, $ExecutionPlan, $SchemaDetails, $AnalysisMetaID)
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-    # FIX: Reverting to colon-syntax as it is the format used in the working client script, but ensuring stable model names are used.
     $uri = "https://generativelanguage.googleapis.com/v1beta/models/$($script:Configuration.ModelName):generateContent?key=$($script:Configuration.ApiKey)"
     $fullPrompt = "$($script:Configuration.PromptText)`n`n### T-SQL QUERY`n$QuerySqlText`n`n### EXECUTION PLAN XML`n$ExecutionPlan`n`n### OBJECT SCHEMAS`n$SchemaDetails"
     Write-DebugLog -AnalysisMetaID $AnalysisMetaID -Message "Sending Gemini Payload: $fullPrompt"
@@ -441,21 +446,25 @@ function Invoke-GeminiAnalysis {
     }
     catch { 
         Write-Log -Level 'ERROR' -Message "Failed to get response from Gemini API. Error: $($_.Exception.Message)"
-        Write-Log -Level 'DEBUG' -Message "Attempted URI: $uri" 
+        Write-DebugLog -AnalysisMetaID $AnalysisMetaID -Message "Attempted URI: $uri" 
         return $null 
     }
 }
 
 function Write-AnalysisMeta {
     param($RunID, $QueryId, $ObjectDatabase, $ObjectSchema, $ObjectName, $MetricValue, $ObjectsParsed, $AnalysisDurationMS)
+    # MetricValue is now passed as NUMERIC(38, 0)
     $insertQuery = "INSERT INTO dbo.Analysis_Meta (RunID, MetricID, ModelID, PromptID, SourceQueryID, ObjectDatabase, ObjectSchema, ObjectName, MetricValue, ObjectsParsed, AnalysisDurationMS) OUTPUT INSERTED.AnalysisMetaID VALUES ($RunID, $($script:Configuration.MetricID), $($script:Configuration.ModelID), $($script:Configuration.PromptID), $QueryId, '$ObjectDatabase', '$ObjectSchema', '$ObjectName', $MetricValue, $ObjectsParsed, $AnalysisDurationMS);"
     try {
         Write-DebugLog -AnalysisMetaID 0 -Message "Executing SQL: $insertQuery"
-        $metaId = (Invoke-Sqlcmd -ServerInstance $ServerName -Database $DatabaseName -Query $insertQuery -TrustServerCertificate).Item(0)
+        $metaId = (Invoke-Sqlcmd -ServerInstance $ServerName -Database $DatabaseName -Query $insertQuery -TrustServerCertificate -ErrorAction Stop).Item(0)
         Write-Log -Level 'INFO' -Message "Created meta record with ID $metaId for Query ID $QueryId."
         return $metaId
     }
-    catch { Write-Log -Level 'ERROR' -Message "Failed to write analysis metadata to the database. Error: $($_.Exception.Message)"; return $null }
+    catch { 
+        Write-Log -Level 'ERROR' -Message "Failed to write analysis metadata to the database. Error: $($_.Exception.Message)"
+        return $null 
+    }
 }
 
 function Write-AnalysisResult {
@@ -523,6 +532,8 @@ catch {
 
 if ($null -eq $dbCheck) {
     # --- FIRST RUN SETUP MODE ---
+    Write-Log -Level 'WARN' -Message "Optimus database '[$DatabaseName]' not found. Running one-time setup wizard."
+    # WARNING: User must run this setup phase again to apply the NUMERIC(38,0) schema change.
     Initialize-Database -TargetServer $ServerName -DbName $DatabaseName
     Set-InitialApiKey -TargetServer $ServerName -DbName $DatabaseName
     Write-Log -Level 'SUCCESS' -Message "--- Optimus setup complete! Please run the script again to begin an analysis. ---"
