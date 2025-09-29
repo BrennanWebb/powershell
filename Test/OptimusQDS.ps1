@@ -30,10 +30,12 @@
 .NOTES
     Designer: Brennan Webb & Gemini
     Script Engine: Gemini
-    Version: 3.5.6
+    Version: 3.5.8
     Created: 2025-07-23
     Modified: 2025-09-27
     Change Log:
+    - v3.5.8: FIXED: Result logging failure during transient network drops. Implemented a single retry loop in Write-AnalysisResult to ensure critical recommendations are successfully logged after a momentary connection error.
+    - v3.5.7: FIXED: Noisy console output from transient network errors during debug logging. Modified Invoke-Sqlcmd inside Write-DebugLog to use -ErrorAction SilentlyContinue to prevent large stack trace output while still logging the failure via Write-Log.
     - v3.5.6: FIXED: Arithmetic Overflow Error converting expression to data type bigint (Msg 8115) by changing the MetricValue column in dbo.Analysis_Meta to NUMERIC(38, 0) and explicitly casting the MetricFormula in Get-WorstOffenders.
               FIXED: 'Cannot validate argument on parameter Level' error by adding 'DEBUG' to the ValidateSet of the Write-Log function.
               Improved debug logging robustness by removing -ErrorAction Stop from Invoke-Sqlcmd inside Write-DebugLog.
@@ -71,7 +73,7 @@ param(
 )
 
 # --- Script-level Variables ---
-$script:ScriptVersion = "3.5.6"
+$script:ScriptVersion = "3.5.8"
 
 #region Helper Functions
 function Write-Log {
@@ -79,7 +81,7 @@ function Write-Log {
         [Parameter(Mandatory = $true)]
         [string]$Message,
         [Parameter(Mandatory = $true)]
-        [ValidateSet('INFO', 'SUCCESS', 'WARN', 'ERROR', 'PROMPT', 'DEBUG')] # ADDED 'DEBUG'
+        [ValidateSet('INFO', 'SUCCESS', 'WARN', 'ERROR', 'PROMPT', 'DEBUG')]
         [string]$Level
     )
     $color = 'Cyan'
@@ -297,11 +299,12 @@ function Write-DebugLog {
         $sanitizedMessage = $Message.Replace("'", "''")
         $query = "INSERT INTO dbo.Analysis_Debug (AnalysisMetaID, DebugFunctionName, Message) VALUES ($metaIdToLog, '$sanitizedFunction', '$sanitizedMessage');"
         try {
-            # Removed -ErrorAction Stop to make debug logging more resilient to broken connections.
-            Invoke-Sqlcmd -ServerInstance $ServerName -Database $DatabaseName -Query $query -TrustServerCertificate -ErrorAction Continue
+            # Set ErrorAction to SilentlyContinue to suppress the large error output to the console 
+            # while the catch block handles the error message logging to the console.
+            Invoke-Sqlcmd -ServerInstance $ServerName -Database $DatabaseName -Query $query -TrustServerCertificate -ErrorAction SilentlyContinue | Out-Null
         }
         catch {
-            # Use Write-Log here for consistent error output
+            # Log the critical failure using the standard error message format.
             Write-Log -Level 'ERROR' -Message "[CRITICAL] Failed to write to the debug log table: $($_.Exception.Message)"
         }
     }
@@ -472,12 +475,25 @@ function Write-AnalysisResult {
     $sanitizedType = $TuningResponseType.Replace("'", "''")
     $sanitizedResponse = $TuningResponse.Replace("'", "''")
     $insertQuery = "INSERT INTO dbo.Analysis_Result (AnalysisMetaID, TuningResponseType, TuningResponse) VALUES ($AnalysisMetaID, '$sanitizedType', '$sanitizedResponse');"
-    try {
-        Write-DebugLog -AnalysisMetaID $AnalysisMetaID -Message "Executing SQL: $insertQuery"
-        Invoke-Sqlcmd -ServerInstance $ServerName -Database $DatabaseName -Query $insertQuery -TrustServerCertificate -ErrorAction Stop
-        Write-Log -Level 'SUCCESS' -Message "Successfully logged [$sanitizedType] recommendation for Meta ID $AnalysisMetaID."
-    }
-    catch { Write-Log -Level 'ERROR' -Message "Failed to write analysis result to the database. Error: $($_.Exception.Message)" }
+    
+    [int]$retryCount = 0
+    do {
+        Write-DebugLog -AnalysisMetaID $AnalysisMetaID -Message "Executing SQL (Attempt $($retryCount + 1)): $insertQuery"
+        try {
+            Invoke-Sqlcmd -ServerInstance $ServerName -Database $DatabaseName -Query $insertQuery -TrustServerCertificate -ErrorAction Stop
+            
+            Write-Log -Level 'SUCCESS' -Message "Successfully logged [$sanitizedType] recommendation for Meta ID $AnalysisMetaID (Attempt $($retryCount + 1))."
+            break # Exit the loop upon success
+        }
+        catch { 
+            if ($retryCount -eq 0) {
+                Write-Log -Level 'WARN' -Message "Transient failure logging result for Meta ID $AnalysisMetaID. Retrying... Error: $($_.Exception.Message)"
+            } else {
+                Write-Log -Level 'ERROR' -Message "Failed to write analysis result after 2 attempts for Meta ID $AnalysisMetaID. Final Error: $($_.Exception.Message)"
+            }
+        }
+        $retryCount++
+    } while ($retryCount -lt 2)
 }
 
 function Update-AnalysisRanks {
@@ -533,7 +549,6 @@ catch {
 if ($null -eq $dbCheck) {
     # --- FIRST RUN SETUP MODE ---
     Write-Log -Level 'WARN' -Message "Optimus database '[$DatabaseName]' not found. Running one-time setup wizard."
-    # WARNING: User must run this setup phase again to apply the NUMERIC(38,0) schema change.
     Initialize-Database -TargetServer $ServerName -DbName $DatabaseName
     Set-InitialApiKey -TargetServer $ServerName -DbName $DatabaseName
     Write-Log -Level 'SUCCESS' -Message "--- Optimus setup complete! Please run the script again to begin an analysis. ---"
