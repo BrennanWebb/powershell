@@ -40,7 +40,11 @@
     If not present, the script defaults to 'Estimated' or will prompt in interactive mode. This parameter is only used for performance tuning analysis.
 
 .PARAMETER OpenTunedFile
-    An optional switch that opens the final tuned or reviewed .sql file using the default OS application (e.g., SSMS) after analysis is complete.
+    An optional switch that opens the final analyzed .sql file using the default OS application (e.g., SSMS) after analysis is complete.
+
+.PARAMETER OpenPlanFile
+    An optional switch that opens the generated .sqlplan file using the default OS application (e.g., SSMS or Sentry Plan Explorer) after it is created.
+    This parameter is only used for performance tuning analysis.
 
 .PARAMETER ResetConfiguration
     An optional switch to trigger an interactive menu that allows for resetting user configurations.
@@ -56,8 +60,8 @@
     Enables detailed diagnostic output to the console. All messages are always written to the execution log file regardless of this setting.
 
 .EXAMPLE
-    .\Optimus.ps1 -FolderPath "C:\My TSQL Projects\Batch1"
-    Runs an interactive performance tuning analysis on all .sql files in the folder.
+    .\Optimus.ps1 -FolderPath "C:\My TSQL Projects\Batch1" -OpenPlanFile
+    Runs a tuning analysis on all .sql files in the folder and automatically opens the generated .sqlplan file for each script in the default application.
 
 .EXAMPLE
     .\Optimus.ps1 -ImportPrompt -Path "C:\MyPrompts\NewTuningPrompt.txt"
@@ -65,11 +69,16 @@
 
 .NOTES
     Designer: Brennan Webb & Gemini
-    Script Engine: Gemini
-    Version: 3.2.5
+    Script Engine: Gemini   
+    Version: 3.4.0
     Created: 2025-06-21
-    Modified: 2025-07-31
+    Modified: 2025-10-07
     Change Log:
+    - v3.4.0: Enhanced the default tuning prompt to guide the AI to critically evaluate index suggestions and avoid duplicates.
+    - v3.3.3: Renamed output files to be based on the source script name for better clarity (e.g., YourScript.sqlplan and YourScript_analyzed.sql).
+    - v3.3.2: Implemented a robust XML node selection method (`SelectSingleNode`) to fix a crash in the plan merging logic.
+    - v3.3.1: Implemented logic to merge multiple XML plans into a single valid .sqlplan file. Refined interactive prompt to only show in true interactive mode.
+    - v3.3.0: Added ability to save a raw .sqlplan file and a new -OpenPlanFile switch to automatically open it in a default application like Sentry Plan Explorer.
     - v3.2.5: Removed literal Markdown from default prompt text to prevent AI confusion.
     - v3.2.4: Added backspace escaping to the manual JSON serializer for full compliance.
     - v3.2.3: Centralized JSON creation to use the manual serializer, ensuring valid output on first run.
@@ -119,6 +128,12 @@ param (
     [Parameter(Mandatory=$false, ParameterSetName='Interactive')]
     [switch]$OpenTunedFile,
     
+    [Parameter(Mandatory=$false, ParameterSetName='Files')]
+    [Parameter(Mandatory=$false, ParameterSetName='Folder')]
+    [Parameter(Mandatory=$false, ParameterSetName='Adhoc')]
+    [Parameter(Mandatory=$false, ParameterSetName='Interactive')]
+    [switch]$OpenPlanFile,
+
     [Parameter(Mandatory=$false)]
     [switch]$ResetConfiguration,
 
@@ -318,8 +333,9 @@ Recommendation Categories:
 You should consider the following categories of recommendations. For any given T-SQL statement, multiple recommendations from different categories might be valid. For example, a statement could be improved with both a query rewrite AND a new index. Present all valid options.
 1.  **Non-Invasive Query Rewrites:** These are the most desirable. Look for opportunities to make predicates SARGable, simplify logic, or use more efficient patterns that are valid for the specified SQL Server version.
 2.  **Indexing Improvements:**
+    Before recommending a new index, you must first verify that no existing index can be slightly altered (e.g., by adding an `INCLUDE` column) to satisfy the query. Do not suggest an index if it is redundant or a near-duplicate of an existing one.
     * **Alter Existing Index:** If an existing index can be modified (e.g., adding an INCLUDE column) to better serve the query, provide the necessary `DROP` and `CREATE` DDL.
-    * **Create New Index:** If no existing index is a suitable candidate for alteration, recommend a new, covering index. Provide the complete `CREATE INDEX` DDL.
+    * **Create New Index:** If no existing index is a suitable candidate for alteration, recommend a new, covering index. The execution plan's "missing index" suggestion should be treated as a starting point, not the final answer. You must critically evaluate this suggestion and improve upon it by adding necessary `INCLUDE` columns to create a true covering index or by optimizing the key column order. Provide the complete `CREATE INDEX` DDL.
 
 Comment Formatting:
 Every analysis comment block you add MUST use the following structure. The block starts with a general "Optimus Analysis" header. Inside, each distinct recommendation is numbered and contains the three required sections. This allows for multiple, independent suggestions for the same statement. Important: All text inside the comment block must be plain text. Do not use any Markdown formatting like bolding or backticks.
@@ -910,7 +926,7 @@ function Get-AnalysisInputs {
     Write-Log -Message "Entering Function: Get-AnalysisInputs" -Level 'DEBUG'
     Write-Log -Message "Parameter Set Name: $($PSCmdlet.ParameterSetName)" -Level 'DEBUG'
     
-    $inputObjects = [System.Collections.Generic.List[object]]::new()
+    $inputObjects = [System.collections.generic.List[object]]::new()
 
     switch ($PSCmdlet.ParameterSetName) {
         'Adhoc' {
@@ -1026,6 +1042,12 @@ function Select-AIPrompt {
         }
     }
 
+    # For non-interactive runs without a specified prompt name, select the default and exit.
+    if ($PSCmdlet.ParameterSetName -ne 'Interactive' -and -not $DebugMode.IsPresent) {
+        Write-Log -Message "Non-interactive mode detected. Automatically selecting the default prompt." -Level 'DEBUG'
+        return $availablePrompts[0].body
+    }
+
     # Interactive selection
     Write-Log -Message "`nPlease select a prompt to use for this $AnalysisType batch:" -Level 'INFO'
     for ($i = 0; $i -lt $availablePrompts.Count; $i++) {
@@ -1090,13 +1112,50 @@ function Get-MasterExecutionPlan {
             return $null
         }
 
-        # Combine all found plan fragments into a single master XML document
+        # Create the wrapped plan for internal parsing.
         $masterPlanXml = "<MasterShowPlan>" + ($planFragments -join '') + "</MasterShowPlan>"
+
+        # Create a valid, merged .sqlplan file by properly merging XML nodes.
+        $rawPlanContent = ''
+        try {
+            # Create a valid, empty master plan structure.
+            $masterShowPlan = [xml]'<ShowPlanXML Version="1.539" Build="16.0.1110.1" xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan"><BatchSequence><Batch></Batch></BatchSequence></ShowPlanXML>'
+            
+            # Use a namespace manager for reliable node selection, which is critical for handling the default namespace.
+            $nsm = New-Object System.Xml.XmlNamespaceManager($masterShowPlan.NameTable)
+            $nsm.AddNamespace("sp", "http://schemas.microsoft.com/sqlserver/2004/07/showplan")
+
+            # Robustly select the target <Batch> node.
+            $batchNode = $masterShowPlan.SelectSingleNode("//sp:Batch", $nsm)
+
+            # Loop through each fragment and merge its statement contents.
+            foreach ($fragment in $planFragments) {
+                $planXml = [xml]$fragment
+                $statementNodes = $planXml.ShowPlanXML.BatchSequence.Batch.ChildNodes
+                foreach ($node in $statementNodes) {
+                    # Import and append each statement into the single master document.
+                    $importedNode = $masterShowPlan.ImportNode($node, $true)
+                    $batchNode.AppendChild($importedNode) | Out-Null
+                }
+            }
+            # Save the final, valid XML.
+            $rawPlanContent = $masterShowPlan.OuterXml
+        } catch {
+             Write-Log -Message "Could not merge XML fragments into a valid .sqlplan file. Error: $($_.Exception.Message)" -Level 'WARN'
+             # Fallback to the potentially invalid raw content if merging fails.
+             $rawPlanContent = $planFragments -join ''
+        }
         
         try {
             [xml]$masterPlanXml | Out-Null
             Write-Log -Message "Successfully generated and validated master execution plan for all statements." -Level 'SUCCESS'
-            return $masterPlanXml
+            
+            # Return an object containing both the raw plan for the .sqlplan file
+            # and the wrapped XML for internal script processing.
+            return [pscustomobject]@{
+                MasterPlanXml    = $masterPlanXml
+                RawPlanContent = $rawPlanContent
+            }
         } catch {
             Write-Log -Message "The combined execution plan string is not valid XML. Error: $($_.Exception.Message)" -Level 'ERROR'
             return $null
@@ -1459,11 +1518,31 @@ function Start-TuningAnalysis {
             
             $initialDbContext = ([regex]::Match($sqlQueryText, '(?im)^\s*USE\s+\[?([\w\d_]+)\]?')).Groups[1].Value
             if ([string]::IsNullOrWhiteSpace($initialDbContext)) { $initialDbContext = 'master' }
-            $masterPlanXml = Get-MasterExecutionPlan -ServerInstance $selectedServer -DatabaseContext $initialDbContext -FullQueryText $sqlQueryText -IsActualPlan:$useActualPlanSwitch
-            if (-not $masterPlanXml) { Write-Log -Message "Could not generate a master plan for $baseName. Skipping." -Level 'ERROR'; continue }
             
-            $planPath = Join-Path -Path $script:AnalysisPath -ChildPath "_MasterPlan.xml"
-            try { $masterPlanXml | Set-Content -Path $planPath -Encoding UTF8; Write-Log -Message "Master execution plan saved." -Level 'DEBUG' } catch { Write-Log -Message "Could not save master plan file." -Level 'WARN' }
+            $planObject = Get-MasterExecutionPlan -ServerInstance $selectedServer -DatabaseContext $initialDbContext -FullQueryText $sqlQueryText -IsActualPlan:$useActualPlanSwitch
+            if (-not $planObject) { Write-Log -Message "Could not generate a master plan for $baseName. Skipping." -Level 'ERROR'; continue }
+            
+            $masterPlanXml = $planObject.MasterPlanXml
+            $xmlPlanPath = Join-Path -Path $script:AnalysisPath -ChildPath "_MasterPlan.xml"
+            try { $masterPlanXml | Set-Content -Path $xmlPlanPath -Encoding UTF8; Write-Log -Message "Master execution plan saved to .xml file." -Level 'DEBUG' } catch { Write-Log -Message "Could not save master plan .xml file." -Level 'WARN' }
+
+            # Save the raw .sqlplan file with the script's base name
+            $sqlPlanPath = Join-Path -Path $script:AnalysisPath -ChildPath "${baseName}.sqlplan"
+            try {
+                $planObject.RawPlanContent | Set-Content -Path $sqlPlanPath -Encoding UTF8
+                Write-Log -Message "Raw execution plan saved to .sqlplan file." -Level 'DEBUG'
+                # Check the new switch and open the file
+                if ($OpenPlanFile.IsPresent) {
+                    try {
+                        Write-Log -Message "Opening .sqlplan file in default application..." -Level 'INFO'
+                        Invoke-Item -Path $sqlPlanPath
+                    } catch {
+                        Write-Log -Message "Failed to open the .sqlplan file automatically: $($_.Exception.Message)" -Level 'WARN'
+                    }
+                }
+            } catch {
+                 Write-Log -Message "Could not save raw .sqlplan file." -Level 'WARN'
+            }
 
             [xml]$masterPlan = $masterPlanXml
             $ns = New-Object System.Xml.XmlNamespaceManager($masterPlan.NameTable)
@@ -1493,9 +1572,9 @@ function Start-TuningAnalysis {
             
             if ($finalScript) {
                 $finalScript = $finalScript.Trim()
-                $tunedScriptPath = Join-Path -Path $script:AnalysisPath -ChildPath "${baseName}_tuned.sql"
-                $finalScript | Out-File -FilePath $tunedScriptPath -Encoding UTF8
-                if ($OpenTunedFile.IsPresent) { try { Invoke-Item -Path $tunedScriptPath } catch { Write-Log -Message "Failed to open the tuned file automatically: $($_.Exception.Message)" -Level 'WARN' } }
+                $analyzedScriptPath = Join-Path -Path $script:AnalysisPath -ChildPath "${baseName}_analyzed.sql"
+                $finalScript | Out-File -FilePath $analyzedScriptPath -Encoding UTF8
+                if ($OpenTunedFile.IsPresent) { try { Invoke-Item -Path $analyzedScriptPath } catch { Write-Log -Message "Failed to open the analyzed file automatically: $($_.Exception.Message)" -Level 'WARN' } }
                 New-AnalysisSummary -TunedScript $finalScript -TotalStatementCount $statementNodes.Count -AnalysisPath $script:AnalysisPath
                 Write-Log -Message "Tuning analysis complete for $baseName." -Level 'SUCCESS'
             } else {
@@ -1553,9 +1632,9 @@ function Start-CodeReviewAnalysis {
 
             if ($finalScript) {
                 $finalScript = $finalScript.Trim()
-                $reviewedScriptPath = Join-Path -Path $script:AnalysisPath -ChildPath "${baseName}_reviewed.sql"
-                $finalScript | Out-File -FilePath $reviewedScriptPath -Encoding UTF8
-                if ($OpenTunedFile.IsPresent) { try { Invoke-Item -Path $reviewedScriptPath } catch { Write-Log -Message "Failed to open the reviewed file automatically: $($_.Exception.Message)" -Level 'WARN' } }
+                $analyzedScriptPath = Join-Path -Path $script:AnalysisPath -ChildPath "${baseName}_analyzed.sql"
+                $finalScript | Out-File -FilePath $analyzedScriptPath -Encoding UTF8
+                if ($OpenTunedFile.IsPresent) { try { Invoke-Item -Path $analyzedScriptPath } catch { Write-Log -Message "Failed to open the analyzed file automatically: $($_.Exception.Message)" -Level 'WARN' } }
                 # For code review, we can approximate statement count by line breaks or semicolons for the summary.
                 $statementCount = ($sqlQueryText -split 'GO|\n|;').Count
                 New-AnalysisSummary -TunedScript $finalScript -TotalStatementCount $statementCount -AnalysisPath $script:AnalysisPath
@@ -1579,7 +1658,7 @@ function Start-CodeReviewAnalysis {
 # --- Main Application Logic ---
 function Start-Optimus {
     # Define the current version of the script in one place.
-    $script:CurrentVersion = "3.2.5"
+    $script:CurrentVersion = "3.4.0"
 
     if ($DebugMode) { Write-Log -Message "Starting Optimus v$($script:CurrentVersion) in Debug Mode." -Level 'DEBUG'}
 
