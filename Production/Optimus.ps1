@@ -3,7 +3,7 @@
     Optimus is a T-SQL advisor that leverages the Gemini AI for performance tuning or standardized code reviews.
 
 .DESCRIPTION
-    This script performs a holistic analysis of a T-SQL query. It has two modes:
+    This script performs a holistic analysis of a T-SQL query. The type of analysis is determined by the prompt selected.
     1. Tuning: It generates a master execution plan, builds a comprehensive schema document for all referenced objects, and provides performance tuning recommendations.
     2. Code Review: It performs a static analysis of the T-SQL script against a set of standardized best practices for readability, maintainability, and security.
 
@@ -24,12 +24,8 @@
     A string containing the T-SQL query to be analyzed. This is useful for passing queries directly from other applications.
     This parameter cannot be used with -SQLFile or -FolderPath.
 
-.PARAMETER CodeReview
-    An optional switch to perform a standardized code review instead of the default performance tuning analysis.
-    When this switch is used, the -ServerName and -UseActualPlan parameters are ignored.
-
 .PARAMETER PromptName
-    An optional parameter to specify the exact name of a prompt from the 'prompts.json' configuration file, bypassing the interactive prompt selection menu.
+    An optional parameter to specify the exact name of a prompt from the 'prompts.json' configuration file, bypassing the interactive prompt selection menu. The 'type' field of this prompt determines the analysis workflow.
 
 .PARAMETER ServerName
     An optional parameter to specify the SQL Server instance for the analysis, bypassing the interactive menu.
@@ -60,8 +56,12 @@
     Enables detailed diagnostic output to the console. All messages are always written to the execution log file regardless of this setting.
 
 .EXAMPLE
-    .\Optimus.ps1 -FolderPath "C:\My TSQL Projects\Batch1" -OpenPlanFile
-    Runs a tuning analysis on all .sql files in the folder and automatically opens the generated .sqlplan file for each script in the default application.
+    .\Optimus.ps1 -FolderPath "C:\My TSQL Projects\Batch1" -PromptName "Tuning1" -OpenPlanFile
+    Runs a tuning analysis on all .sql files in the folder using the "Tuning1" prompt and automatically opens the generated .sqlplan file for each script.
+
+.EXAMPLE
+    .\Optimus.ps1 -SQLFile "C:\Scripts\MyProcedure.sql" -PromptName "CodeReview1"
+    Runs a standardized code review on the specified .sql file.
 
 .EXAMPLE
     .\Optimus.ps1 -ImportPrompt -Path "C:\MyPrompts\NewTuningPrompt.txt"
@@ -70,20 +70,16 @@
 .NOTES
     Designer: Brennan Webb & Gemini
     Script Engine: Gemini   
-    Version: 3.4.0
+    Version: 3.5.0
     Created: 2025-06-21
-    Modified: 2025-10-07
+    Modified: 2025-10-15
     Change Log:
+    - v3.5.0: Removed -CodeReview switch. Analysis mode is now driven by the 'type' field in the selected prompt from prompts.json. Renamed default prompts to 'Tuning1' and 'CodeReview1'.
     - v3.4.0: Enhanced the default tuning prompt to guide the AI to critically evaluate index suggestions and avoid duplicates.
     - v3.3.3: Renamed output files to be based on the source script name for better clarity (e.g., YourScript.sqlplan and YourScript_analyzed.sql).
     - v3.3.2: Implemented a robust XML node selection method (`SelectSingleNode`) to fix a crash in the plan merging logic.
     - v3.3.1: Implemented logic to merge multiple XML plans into a single valid .sqlplan file. Refined interactive prompt to only show in true interactive mode.
     - v3.3.0: Added ability to save a raw .sqlplan file and a new -OpenPlanFile switch to automatically open it in a default application like Sentry Plan Explorer.
-    - v3.2.5: Removed literal Markdown from default prompt text to prevent AI confusion.
-    - v3.2.4: Added backspace escaping to the manual JSON serializer for full compliance.
-    - v3.2.3: Centralized JSON creation to use the manual serializer, ensuring valid output on first run.
-    - v3.2.2: Added tab character escaping to the manual JSON serializer to ensure full JSON compliance.
-    - v3.2.1: Corrected string escaping logic in the manual JSON serializer.
 
     Powershell Version: 5.1+
 #>
@@ -97,12 +93,6 @@ param (
 
     [Parameter(Mandatory=$true, ParameterSetName='Adhoc')]
     [string]$AdhocSQL,
-
-    [Parameter(Mandatory=$false, ParameterSetName='Files')]
-    [Parameter(Mandatory=$false, ParameterSetName='Folder')]
-    [Parameter(Mandatory=$false, ParameterSetName='Adhoc')]
-    [Parameter(Mandatory=$false, ParameterSetName='Interactive')]
-    [switch]$CodeReview,
 
     [Parameter(Mandatory=$false, ParameterSetName='Files')]
     [Parameter(Mandatory=$false, ParameterSetName='Folder')]
@@ -314,7 +304,7 @@ function Initialize-PromptConfiguration {
     $defaultPrompts = @{
         prompts = @(
             @{
-                name = "Default Tuning Prompt"
+                name = "Tuning1"
                 type = "Tuning"
                 description = "The standard, built-in prompt for performance tuning analysis."
                 body = @"
@@ -370,7 +360,7 @@ Final Output Rules:
 "@
             },
             @{
-                name = "Default Code Review Prompt"
+                name = "CodeReview1"
                 type = "CodeReview"
                 description = "The standard, built-in prompt for code style and best practices review."
                 body = @"
@@ -1009,11 +999,6 @@ function Get-AnalysisInputs {
 }
 
 function Select-AIPrompt {
-    param(
-        [Parameter(Mandatory=$true)]
-        [ValidateSet('Tuning', 'CodeReview')]
-        [string]$AnalysisType
-    )
     Write-Log -Message "Entering Function: Select-AIPrompt" -Level 'DEBUG'
     $promptFile = $script:OptimusConfig.PromptFile
     if (-not (Test-Path $promptFile)) {
@@ -1022,37 +1007,36 @@ function Select-AIPrompt {
     }
 
     $allPrompts = (Get-Content -Path $promptFile -Raw | ConvertFrom-Json).prompts
-    $availablePrompts = @($allPrompts | Where-Object { $_.type -eq $AnalysisType })
 
-    if ($availablePrompts.Count -eq 0) {
-        Write-Log -Message "Could not find any prompts of type '$AnalysisType' in '$promptFile'." -Level 'ERROR'
+    if ($allPrompts.Count -eq 0) {
+        Write-Log -Message "Could not find any prompts in '$promptFile'." -Level 'ERROR'
         return $null
     }
 
     # Automated selection via -PromptName parameter
     if (-not [string]::IsNullOrWhiteSpace($PromptName)) {
-        Write-Log -Message "PromptName parameter used. Searching for prompt: '$PromptName' of type '$AnalysisType'" -Level 'DEBUG'
-        $selectedPrompt = $availablePrompts | Where-Object { $_.name -eq $PromptName }
+        Write-Log -Message "PromptName parameter used. Searching for prompt: '$PromptName'" -Level 'DEBUG'
+        $selectedPrompt = $allPrompts | Where-Object { $_.name -eq $PromptName }
         if ($selectedPrompt) {
-            Write-Log -Message "Found matching prompt: '$($selectedPrompt.Name)'." -Level 'SUCCESS'
-            return $selectedPrompt.body
+            Write-Log -Message "Found matching prompt: '$($selectedPrompt.Name)' of type '$($selectedPrompt.type)'." -Level 'SUCCESS'
+            return $selectedPrompt
         } else {
-            Write-Log -Message "A prompt with the name '$PromptName' and type '$AnalysisType' was not found in prompts.json." -Level 'ERROR'
+            Write-Log -Message "A prompt with the name '$PromptName' was not found in prompts.json." -Level 'ERROR'
             return $null
         }
     }
 
     # For non-interactive runs without a specified prompt name, select the default and exit.
     if ($PSCmdlet.ParameterSetName -ne 'Interactive' -and -not $DebugMode.IsPresent) {
-        Write-Log -Message "Non-interactive mode detected. Automatically selecting the default prompt." -Level 'DEBUG'
-        return $availablePrompts[0].body
+        Write-Log -Message "Non-interactive mode detected. Automatically selecting the default prompt 'Tuning1'." -Level 'DEBUG'
+        return $allPrompts | Where-Object { $_.name -eq 'Tuning1' }
     }
 
-    # Interactive selection
-    Write-Log -Message "`nPlease select a prompt to use for this $AnalysisType batch:" -Level 'INFO'
-    for ($i = 0; $i -lt $availablePrompts.Count; $i++) {
-        Write-Log -Message "   [$($i+1)] $($availablePrompts[$i].name)" -Level 'PROMPT'
-        Write-Log -Message "        $($availablePrompts[$i].description)" -Level 'PROMPT'
+    # Interactive selection from a consolidated list
+    Write-Log -Message "`nPlease select a prompt to use for this analysis batch:" -Level 'INFO'
+    for ($i = 0; $i -lt $allPrompts.Count; $i++) {
+        Write-Log -Message "   [$($i+1)] $($allPrompts[$i].name) ($($allPrompts[$i].type))" -Level 'PROMPT'
+        Write-Log -Message "        $($allPrompts[$i].description)" -Level 'PROMPT'
     }
 
     while ($true) {
@@ -1061,12 +1045,12 @@ function Select-AIPrompt {
         Write-Host ""
         Write-Log -Message "User Input: $choice" -Level 'DEBUG'
         if ([string]::IsNullOrWhiteSpace($choice)) { $choice = 1 }
-        if ($choice -match '^\d+$' -and [int]$choice -ge 1 -and [int]$choice -le $availablePrompts.Count) {
-            $selectedPrompt = $availablePrompts[[int]$choice - 1]
+        if ($choice -match '^\d+$' -and [int]$choice -ge 1 -and [int]$choice -le $allPrompts.Count) {
+            $selectedPrompt = $allPrompts[[int]$choice - 1]
             Write-Log -Message "User selected prompt: '$($selectedPrompt.name)'" -Level 'DEBUG'
-            return $selectedPrompt.body
+            return $selectedPrompt
         } else {
-            Write-Log -Message "Invalid selection. Please enter a number between 1 and $($availablePrompts.Count)." -Level 'ERROR'
+            Write-Log -Message "Invalid selection. Please enter a number between 1 and $($allPrompts.Count)." -Level 'ERROR'
         }
     }
 }
@@ -1436,6 +1420,10 @@ Timestamp: $(Get-Date)
 # --- Analysis Workflow Handlers ---
 
 function Start-TuningAnalysis {
+    param(
+        [Parameter(Mandatory=$true)]
+        $SelectedPrompt
+    )
     Write-Log -Message "Starting new batch in Performance Tuning mode." -Level 'INFO'
 
     # Server Selection Logic
@@ -1465,12 +1453,7 @@ function Start-TuningAnalysis {
         return 
     }
     
-    # Select the AI prompt once for the entire batch.
-    $selectedPromptBody = Select-AIPrompt -AnalysisType 'Tuning'
-    if (-not $selectedPromptBody) {
-        Write-Log -Message "No valid prompt was selected. Halting batch." -Level 'ERROR'
-        return
-    }
+    $selectedPromptBody = $SelectedPrompt.body
 
     [array]$analysisInputs = Get-AnalysisInputs
     if ($null -eq $analysisInputs -or $analysisInputs.Count -eq 0) {
@@ -1593,14 +1576,13 @@ function Start-TuningAnalysis {
 }
 
 function Start-CodeReviewAnalysis {
+    param(
+        [Parameter(Mandatory=$true)]
+        $SelectedPrompt
+    )
     Write-Log -Message "Starting new batch in Code Review mode." -Level 'INFO'
 
-    # Select the AI prompt once for the entire batch.
-    $selectedPromptBody = Select-AIPrompt -AnalysisType 'CodeReview'
-    if (-not $selectedPromptBody) {
-        Write-Log -Message "No valid prompt was selected. Halting batch." -Level 'ERROR'
-        return
-    }
+    $selectedPromptBody = $SelectedPrompt.body
 
     [array]$analysisInputs = Get-AnalysisInputs
     if ($null -eq $analysisInputs -or $analysisInputs.Count -eq 0) {
@@ -1658,7 +1640,7 @@ function Start-CodeReviewAnalysis {
 # --- Main Application Logic ---
 function Start-Optimus {
     # Define the current version of the script in one place.
-    $script:CurrentVersion = "3.4.0"
+    $script:CurrentVersion = "3.5.0"
 
     if ($DebugMode) { Write-Log -Message "Starting Optimus v$($script:CurrentVersion) in Debug Mode." -Level 'DEBUG'}
 
@@ -1677,26 +1659,18 @@ function Start-Optimus {
         return # Exit after import
     }
 
-    # Group prerequisite checks for analysis workflows
-    $checksPassed = {
-        if (-not (Test-WindowsEnvironment)) { return $false }
-        if (-not (Test-PowerShellVersion)) { return $false }
-        if (-not (Test-InternetConnection)) { Write-Log -Message "Exiting due to no internet connection or user choice." -Level 'ERROR'; return $false }
+    # Prerequisite checks for analysis workflows
+    $prereqsPassed = $true
+    if (-not (Test-WindowsEnvironment)) { $prereqsPassed = $false }
+    if (-not (Test-PowerShellVersion)) { $prereqsPassed = $false }
+    if (-not (Test-InternetConnection)) { Write-Log -Message "Exiting due to no internet connection or user choice." -Level 'ERROR'; $prereqsPassed = $false }
+    if ($prereqsPassed) {
         Invoke-OptimusVersionCheck -CurrentVersion $script:CurrentVersion
-        if (-not (Get-And-Set-ApiKey)) { Write-Log -Message "Exiting due to missing API key." -Level 'ERROR'; return $false }
+        if (-not (Get-And-Set-ApiKey)) { Write-Log -Message "Exiting due to missing API key." -Level 'ERROR'; $prereqsPassed = $false }
         $script:ChosenModel = Get-And-Set-Model
-        if (-not $script:ChosenModel) { Write-Log -Message "Exiting due to no model being selected." -Level 'ERROR'; return $false }
-
-        # The SQLServer module is only required for Tuning mode.
-        if (-not $CodeReview.IsPresent) {
-             if (-not (Test-SqlServerModule)) { return $false }
-        } else {
-            Write-Log -Message "Code Review mode selected, skipping SQL Server module check." -Level 'DEBUG'
-        }
-        return $true
-    }.Invoke()
-
-    if (-not $checksPassed) { return }
+        if (-not $script:ChosenModel) { Write-Log -Message "Exiting due to no model being selected." -Level 'ERROR'; $prereqsPassed = $false }
+    }
+    if (-not $prereqsPassed) { return }
 
     Write-Log -Message "`n--- Welcome to Optimus v$($script:CurrentVersion) ---" -Level 'SUCCESS'
     if (-not $DebugMode) { Write-Log -Message "All prerequisite checks passed." -Level 'SUCCESS' }
@@ -1704,47 +1678,35 @@ function Start-Optimus {
     do { # Outer loop to allow running multiple batches
         $script:AnalysisPath = $null 
         $script:LogFilePath = $null
-        $analysisMode = 'Tuning' # Default to tuning
-
-        # Determine Analysis Mode
-        if ($CodeReview.IsPresent) {
-            $analysisMode = 'CodeReview'
-        } elseif ($PSCmdlet.ParameterSetName -eq 'Interactive') {
-            Write-Log -Message "`nPlease select the type of analysis to perform:" -Level 'INFO'
-            Write-Log -Message "   [1] T-SQL Performance Tuning (Default)" -Level 'PROMPT'
-            Write-Log -Message "   [2] Standardized Code Review" -Level 'PROMPT'
-            Write-Log -Message "   [Q] Quit" -Level 'PROMPT'
-            
-            while($true) {
-                Write-Log -Message "   Enter your choice: " -Level 'PROMPT' -NoNewLine
-                $choice = Read-Host
-                Write-Host ""
-                Write-Log -Message "User Input: $choice" -Level 'DEBUG'
-
-                if ([string]::IsNullOrWhiteSpace($choice)) { $choice = '1' }
-
-                $isValidChoice = $true # Assume the choice is valid initially
-                switch($choice) {
-                    '1' { $analysisMode = 'Tuning' }
-                    '2' { $analysisMode = 'CodeReview' }
-                    'Q' { Write-Log -Message "Exiting." -Level 'INFO'; return }
-                    default {
-                        Write-Log -Message "Invalid selection. Please enter 1, 2, or Q." -Level 'ERROR'
-                        $isValidChoice = $false # The choice was not valid
-                    }
-                }
-                
-                if ($isValidChoice) {
-                    break # This break now correctly exits the 'while' loop
-                }
-            }
+        
+        # Select the prompt first. This determines the entire workflow.
+        $selectedPrompt = Select-AIPrompt
+        if (-not $selectedPrompt) {
+            Write-Log -Message "No valid prompt was selected. Halting batch." -Level 'ERROR'
+            break # Exit the do-while loop
         }
 
-        # Call the appropriate handler based on the selected mode
-        if ($analysisMode -eq 'Tuning') {
-            Start-TuningAnalysis
-        } else { # 'CodeReview'
-            Start-CodeReviewAnalysis
+        # The SQLServer module is only required for Tuning mode.
+        if ($selectedPrompt.type -eq 'Tuning') {
+             if (-not (Test-SqlServerModule)) {
+                 Write-Log -Message "SQL Server module is required for Tuning analysis. Halting." -Level 'ERROR'
+                 break
+             }
+        } else {
+            Write-Log -Message "Selected prompt type is '$($selectedPrompt.type)', skipping SQL Server module check." -Level 'DEBUG'
+        }
+        
+        # Call the appropriate handler based on the prompt's type
+        switch ($selectedPrompt.type) {
+            'Tuning' {
+                Start-TuningAnalysis -SelectedPrompt $selectedPrompt
+            }
+            'CodeReview' {
+                Start-CodeReviewAnalysis -SelectedPrompt $selectedPrompt
+            }
+            default {
+                Write-Log -Message "The selected prompt has an unknown or unsupported type: '$($selectedPrompt.type)'. Halting." -Level 'ERROR'
+            }
         }
         
         Write-Log -Message "`nWould you like to analyze another batch of files? (Y/N): " -Level 'PROMPT' -NoNewLine
